@@ -6,6 +6,8 @@ ALTURA_TELA = 720
 TAMANHO_PERSONAGEM = 300
 TAMANHO_CAIXA = 300
 
+
+
 def nao_escapar(pos_x, pos_y):
     if (pos_x < 0):
         pos_x = 0
@@ -42,16 +44,70 @@ def colidiu(personagem_x, personagem_y, caixa_x, caixa_y, caixa_tamanho):
     caixa_rect = caixa_rect.inflate(-caixa_tamanho * 0.45, -caixa_tamanho * 0.45)
     return personagem_rect.colliderect(caixa_rect)
 
+
+def tela_inicial(screen):
+    # Carrega as imagens
+    fundo = pygame.image.load("Imagens/fundo_inicio.png").convert()
+    fundo = pygame.transform.scale(fundo, (LARGURA_TELA, ALTURA_TELA))
+
+    botao = pygame.image.load("Imagens/botao_inicio.png").convert_alpha()
+
+    # Se quiser mudar o tamanho do botão
+    botao = pygame.transform.scale(botao, (250, 90))
+
+    # Centraliza o botão
+    botao_rect = botao.get_rect(center=(LARGURA_TELA // 4.4, 593))
+
+    clock = pygame.time.Clock()
+
+    esperando = True
+    while esperando:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                exit()
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if botao_rect.collidepoint(event.pos):
+                    esperando = False
+
+        screen.blit(fundo, (0, 0))
+        screen.blit(botao, botao_rect)
+
+        pygame.display.flip()
+        clock.tick(60)
+
 def main():
     pygame.init()
     screen = pygame.display.set_mode((LARGURA_TELA, ALTURA_TELA))
     clock = pygame.time.Clock()
+
+    tela_inicial(screen) 
+
     running = True
 
-    personagem = pygame.image.load('p_atras.png').convert_alpha()
-    personagem = pygame.transform.scale(personagem, (300, 300))
+    sprite = pygame.image.load('Imagens/sprite1.png').convert_alpha()
 
-    caminho = pygame.image.load('caminho.png').convert_alpha()
+    frames = []
+
+    LARGURA_FRAME = 366
+    ALTURA_FRAME = 825
+
+    for linha in range(2):
+        for coluna in range(3):
+            frame = sprite.subsurface(
+                (
+                    coluna * LARGURA_FRAME,
+                    linha * ALTURA_FRAME,
+                    LARGURA_FRAME,
+                    ALTURA_FRAME,
+                )
+            )
+
+            frame = pygame.transform.scale(frame, (300, 300))
+            frames.append(frame)
+
+    caminho = pygame.image.load('Imagens/caminho.png').convert_alpha()
     caminho = pygame.transform.scale(caminho, (LARGURA_TELA, ALTURA_TELA))
 
     caixa = pygame.image.load('caixa.png').convert_alpha()
@@ -64,12 +120,14 @@ def main():
     fonte = pygame.font.SysFont(None, 48)
     game_over = False
 
+    frame_atual = 0
+    contador = 0
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
-        screen.fill('green')
         screen.blit(caminho, (0, 0))
         
         if not game_over:
@@ -91,7 +149,13 @@ def main():
             if colidiu(pos_x, pos_y, caixa_atual['x'], caixa_atual['y'], tamanho_caixa):
                 game_over = True
 
-        screen.blit(personagem, (pos_x, pos_y))
+        contador += 1
+
+        if contador >= 8:
+            contador = 0
+            frame_atual = (frame_atual + 1) % len(frames)
+
+        screen.blit(frames[frame_atual], (pos_x, pos_y))
 
         if game_over:
             texto = fonte.render('GAME OVER', True, 'white')

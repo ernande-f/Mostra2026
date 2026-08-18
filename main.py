@@ -47,7 +47,7 @@ def colidiu(personagem_x, personagem_y, caixa_x, caixa_y, caixa_tamanho):
 
 def tela_inicial(screen):
     # Carrega as imagens
-    fundo = pygame.image.load("Imagens/fundo_inicio.png").convert()
+    fundo = pygame.image.load("Imagens/fundo_inicio.jpg").convert()
     fundo = pygame.transform.scale(fundo, (LARGURA_TELA, ALTURA_TELA))
 
     botao = pygame.image.load("Imagens/botao_inicio.png").convert_alpha()
@@ -107,7 +107,7 @@ def main():
             frame = pygame.transform.scale(frame, (300, 300))
             frames.append(frame)
 
-    caminho = pygame.image.load('Imagens/caminho.png').convert_alpha()
+    caminho = pygame.image.load('Imagens/fundo_jogo/caminho.png').convert_alpha()
     caminho = pygame.transform.scale(caminho, (LARGURA_TELA, ALTURA_TELA))
 
     caixa = pygame.image.load('caixa.png').convert_alpha()

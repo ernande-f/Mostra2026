@@ -13,7 +13,7 @@ ALTURA_VIRTUAL = 720
 FPS = 60
 
 # ==========================================
-# CONSTANTES DA PISTA (ANÉIS DE SATURNO - LADO DIREITO)
+# CONSTANTES DA PISTA (ANÉIS DE SATURNO - 3 TRILHAS)
 # ==========================================
 # Os anéis de Saturno ficam na metade direita da imagem
 # No topo da pista (horizonte dos anéis)
@@ -30,12 +30,20 @@ BASE_X_MAX = 1130
 BASE_CENTER_X = (BASE_X_MIN + BASE_X_MAX) / 2
 BASE_LARGURA = BASE_X_MAX - BASE_X_MIN
 
+# Configuração das 3 Trilhas (Faixas / Lanes)
+# 0 = Trilha Esquerda | 1 = Trilha Central | 2 = Trilha Direita
+LANE_RATIOS = [0.18, 0.50, 0.82]
+NUM_LANES = len(LANE_RATIOS)
+NOME_TRILHAS = ["0 (Esquerda)", "1 (Centro)", "2 (Direita)"]
+
 # Dimensões da Vaca nos Anéis
 LARGURA_VACA_NORMAL = 105
 ALTURA_VACA_NORMAL = 135
 LARGURA_VACA_AGACHADA = 105
 ALTURA_VACA_AGACHADA = 90
-VELOCIDADE_VACA = 8.5
+
+# FLAG DE CONTROLE DE AGACHAMENTO (Temporariamente desativado conforme solicitado)
+ENABLE_CROUCH = False
 
 # Dimensões dos Obstáculos
 TAMANHO_OBSTACULO_MIN = 18
@@ -43,88 +51,193 @@ TAMANHO_OBSTACULO_MAX = 68
 
 
 # =========================================================
-# CONTROLADOR DE ENTRADA (PRONTO PARA TECLADO E ESP32)
+# CONTROLADOR DE ENTRADA (SISTEMA DE TRILHAS E ACELERÔMETRO)
 # =========================================================
 class InputController:
     """
-    Abstrai as entradas do jogo.
-    Suporta Teclado nativamente e possui estrutura em thread
-    para conexão futura com ESP32 via Bluetooth / Porta Serial.
+    Abstrai as entradas do jogo com sistema de Trilhas (Lanes).
+    Detecta passos/deslocamentos laterais e dispara troca de trilha discreta.
     """
     def __init__(self):
-        self.move_x = 0.0          # -1.0 (esquerda) a +1.0 (direita)
+        self.lane_shift_event = 0  # -1 = Mudar para Esquerda | +1 = Mudar para Direita | 0 = Nenhum
         self.is_crouching = False  # True quando agachado
         
-        # Variáveis para integração com ESP32 / Acelerômetro
+        # Telemetria para Debug
+        self.raw_ax = 0.0          # Aceleração X em Gs
+        self.raw_ay = 0.0          # Aceleração Lateral Y em Gs (Translação / Passos)
+        self.raw_az = 1.0          # Aceleração Vertical Z em Gs
+        self.raw_crouch = 0
+        
+        self.active_port_name = "Nenhuma"
+        self.show_debug = True     # Exibe a tabela de debug na tela
+        
+        # Variáveis para integração com ESP32
         self.esp32_connected = False
         self.esp32_thread = None
         self.esp32_running = False
-        self.esp32_port = None
+        self.esp32_port = "auto"
+        self.esp32_baudrate = 115200
         
-        # Limiares de calibração do acelerômetro
-        self.tilt_deadzone = 12.0    # graus de inclinação neutra
-        self.tilt_max = 45.0         # graus para velocidade máxima
-        self.crouch_accel_thresh = -1.2  # limiar de agachamento corporal
+        # Limiares de ALTA SENSIBILIDADE (Disparo Rápido com Aceleração Leve)
+        self.accel_trigger_thresh = 0.07  # Gs para disparar a troca de trilha (Alta Sensibilidade)
+        self.accel_reset_thresh = 0.035   # Gs para rearmar o gatilho
+        self.accel_armed = True
+        self.last_shift_time = 0.0
+        self.shift_cooldown = 0.16        # Cooldown mínimo rápido em segundos
+        
+        # Debounce do teclado
+        self.prev_k_left = False
+        self.prev_k_right = False
 
     def update_from_keyboard(self, keys):
-        """Lê os comandos do teclado."""
-        # Movimento horizontal
-        target_x = 0.0
-        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-            target_x -= 1.0
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-            target_x += 1.0
-        self.move_x = target_x
+        """Lê os comandos do teclado detectando cliques únicos para troca de trilha."""
+        k_left = keys[pygame.K_LEFT] or keys[pygame.K_a]
+        k_right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
 
-        # Agachamento
-        self.is_crouching = (
-            keys[pygame.K_DOWN] or 
-            keys[pygame.K_s] or 
-            keys[pygame.K_SPACE] or 
-            keys[pygame.K_LSHIFT]
-        )
+        # Dispara mudança de trilha apenas no momento em que a tecla é pressionada
+        if k_left and not self.prev_k_left:
+            self.lane_shift_event = -1
+        elif k_right and not self.prev_k_right:
+            self.lane_shift_event = +1
 
-    def start_esp32_connection(self, port="/dev/tty.ESP32_COW", baudrate=115200):
-        """
-        Inicia a leitura em segundo plano dos dados do ESP32 via Serial/Bluetooth.
-        Não bloqueia o loop principal de 60 FPS do Pygame.
-        """
+        self.prev_k_left = k_left
+        self.prev_k_right = k_right
+
+        # Agachamento via teclado (controlado pela flag ENABLE_CROUCH)
+        if ENABLE_CROUCH:
+            tecla_agachar = (
+                keys[pygame.K_DOWN] or 
+                keys[pygame.K_s] or 
+                keys[pygame.K_SPACE] or 
+                keys[pygame.K_LSHIFT]
+            )
+            if tecla_agachar or not self.esp32_connected:
+                self.is_crouching = tecla_agachar
+        else:
+            self.is_crouching = False
+
+    def start_esp32_connection(self, port="auto", baudrate=115200):
+        """Inicia a leitura em segundo plano dos dados do ESP32."""
         self.esp32_port = port
+        self.esp32_baudrate = baudrate
         self.esp32_running = True
         self.esp32_thread = threading.Thread(target=self._esp32_worker, daemon=True)
         self.esp32_thread.start()
 
-    def _esp32_worker(self):
-        """Thread que recebe e interpreta os pacotes do ESP32."""
+    def _find_esp32_port(self):
+        """Tenta encontrar automaticamente a porta do ESP32 no macOS/Linux/Windows."""
         try:
-            import serial  # pyserial
-            ser = serial.Serial(self.esp32_port, 115200, timeout=0.1)
-            self.esp32_connected = True
-            print(f"[ESP32] Conectado com sucesso na porta {self.esp32_port}")
-            
-            while self.esp32_running:
-                linha = ser.readline().decode('utf-8', errors='ignore').strip()
-                if linha:
-                    # Formato esperado do ESP32: "ROLL,PITCH,CROUCH_FLAG" ou JSON
-                    partes = linha.split(',')
-                    if len(partes) >= 2:
-                        try:
-                            roll = float(partes[0])   # Inclinação lateral (esquerda/direita)
-                            crouch = int(partes[1]) if len(partes) > 2 else 0
-                            
-                            # Mapeia inclinação lateral para -1.0 a +1.0
-                            if abs(roll) < self.tilt_deadzone:
-                                self.move_x = 0.0
-                            else:
-                                raw_val = (roll - math.copysign(self.tilt_deadzone, roll)) / (self.tilt_max - self.tilt_deadzone)
-                                self.move_x = max(-1.0, min(1.0, raw_val))
-                            
-                            self.is_crouching = bool(crouch)
-                        except ValueError:
-                            pass
+            import serial.tools.list_ports
+            ports = list(serial.tools.list_ports.comports())
+            for p in ports:
+                name = p.device.lower()
+                desc = (p.description or "").lower()
+                if any(k in name or k in desc for k in [
+                    "usbserial", "wchusbserial", "slab_usbtouart", "usbmodem", 
+                    "cp210", "ch340", "ftdi", "esp32"
+                ]):
+                    return p.device
+            for p in ports:
+                if "cu.usb" in p.device.lower() or "ttyusb" in p.device.lower():
+                    return p.device
         except Exception as e:
-            self.esp32_connected = False
-            # Falha silenciosa de conexão para não interromper testes no teclado
+            print(f"[DEBUG] Erro ao listar portas: {e}")
+        return None
+
+    def _esp32_worker(self):
+        """Thread resiliente de alta sensibilidade para impulsos laterais."""
+        try:
+            import serial
+        except ImportError:
+            print("[AVISO] Pacote 'pyserial' não instalado. Execute: pip install pyserial")
+            return
+
+        logged_search = False
+        while self.esp32_running:
+            target_port = self.esp32_port
+            if target_port == "auto" or target_port is None:
+                target_port = self._find_esp32_port()
+
+            if not target_port:
+                if not logged_search:
+                    print("[ESP32] Procurando porta USB do ESP32... (Você pode jogar no teclado normalmente)")
+                    logged_search = True
+                self.esp32_connected = False
+                self.active_port_name = "Nenhuma"
+                time.sleep(1.5)
+                continue
+
+            try:
+                print(f"[ESP32] Conectando na porta: {target_port} ...")
+                with serial.Serial(target_port, self.esp32_baudrate, timeout=0.5) as ser:
+                    self.esp32_connected = True
+                    self.active_port_name = target_port.split('/')[-1]
+                    print(f"\n=======================================================")
+                    print(f"  [ESP32] CONECTADO COM SUCESSO na porta {target_port}!")
+                    print(f"=======================================================\n")
+                    
+                    while self.esp32_running:
+                        linha = ser.readline().decode('utf-8', errors='ignore').strip()
+                        if linha:
+                            partes = [p.strip() for p in linha.split(',') if p.strip()]
+                            if len(partes) >= 1:
+                                try:
+                                    if len(partes) == 1:
+                                        # Formato puro de alta sensibilidade: AY
+                                        ay = float(partes[0])
+                                        ax = 0.0
+                                        az = 1.0
+                                        crouch = 0
+                                    elif len(partes) == 4:
+                                        # Formato AX, AY, AZ, CROUCH
+                                        ax = float(partes[0])
+                                        ay = float(partes[1])
+                                        az = float(partes[2])
+                                        crouch = int(partes[3])
+                                    elif len(partes) >= 6:
+                                        # Formato estendido: ROLL, PITCH, CROUCH, AX, AY, AZ
+                                        crouch = int(partes[2])
+                                        ax = float(partes[3])
+                                        ay = float(partes[4])
+                                        az = float(partes[5])
+                                    else:
+                                        ay = float(partes[0])
+                                        ax = 0.0
+                                        az = 1.0
+                                        crouch = 0
+                                    
+                                    self.raw_ax = ax
+                                    self.raw_ay = ay
+                                    self.raw_az = az
+                                    self.raw_crouch = crouch
+
+                                    # Detecção de Alta Sensibilidade por Aceleração Positiva / Negativa
+                                    agora = time.time()
+                                    if self.accel_armed and (agora - self.last_shift_time > self.shift_cooldown):
+                                        if ay > self.accel_trigger_thresh:
+                                            # Aceleração Positiva -> Mover para a Direita
+                                            self.lane_shift_event = +1
+                                            self.accel_armed = False
+                                            self.last_shift_time = agora
+                                        elif ay < -self.accel_trigger_thresh:
+                                            # Aceleração Negativa -> Mover para a Esquerda
+                                            self.lane_shift_event = -1
+                                            self.accel_armed = False
+                                            self.last_shift_time = agora
+                                    elif abs(ay) < self.accel_reset_thresh:
+                                        # Quando volta próximo a zero, rearma o gatilho imediatamente
+                                        self.accel_armed = True
+
+                                    self.is_crouching = bool(crouch) if ENABLE_CROUCH else False
+                                except ValueError:
+                                    pass
+            except Exception as e:
+                self.esp32_connected = False
+                self.active_port_name = "Erro de Conexão"
+                err_str = str(e).lower()
+                if "busy" in err_str or "resource" in err_str or "permission" in err_str:
+                    print(f"[AVISO ESP32] A porta {target_port} está ocupada. FECHE o Serial Monitor do Arduino IDE!")
+                time.sleep(2.0)
 
 
 # =========================================================
@@ -217,54 +330,68 @@ def calcular_posicao_pista(progresso_y, lane_ratio):
 
 
 def criar_obstaculo(velocidade_base=1.0):
-    """Gera um obstáculo no horizonte associado a uma faixa da pista."""
+    """Gera um obstáculo no horizonte alinhado em uma das 3 trilhas."""
+    lane_idx = random.randint(0, NUM_LANES - 1)
     return {
-        'lane': random.uniform(0.05, 0.95),  # Posição relativa na pista
+        'lane_idx': lane_idx,
+        'lane': LANE_RATIOS[lane_idx],     # Posição exata da trilha
         'progresso_y': -0.15,               # Começa um pouco antes do horizonte
         'velocidade': random.uniform(0.009, 0.015) * velocidade_base,
     }
 
 
 # =========================================================
-# CLASSE DA VACA (PLAYER)
+# CLASSE DA VACA (PLAYER COM SISTEMA DE TRILHAS)
 # =========================================================
 class VacaPlayer:
     def __init__(self, frames_andar, frames_agachar):
         self.frames_andar = frames_andar
         self.frames_agachar = frames_agachar
         
-        # Posição horizontal contínua (centro da pista)
-        self.x = (BASE_X_MIN + BASE_X_MAX - LARGURA_VACA_NORMAL) / 2.0
-        self.y_base = BASE_Y  # Linha dos pés da vaca
+        # Inicia na Trilha Central (1 = Centro)
+        self.current_lane = 1
+        self.target_x = self._calcular_x_da_trilha(self.current_lane)
+        self.x = self.target_x
+        self.y_base = BASE_Y
         
         self.is_crouching = False
         self.is_moving = False
         
         self.frame_index = 0.0
-        self.anim_speed = 0.18
+        self.anim_speed = 0.22
+
+    def _calcular_x_da_trilha(self, lane_idx):
+        """Calcula a posição X centralizada da vaca na trilha especificada."""
+        lane_ratio = LANE_RATIOS[lane_idx]
+        cx, _, _ = calcular_posicao_pista(1.0, lane_ratio)
+        return cx - (LARGURA_VACA_NORMAL / 2.0)
 
     def update(self, input_ctrl):
-        # Atualiza estado de agachamento
-        self.is_crouching = input_ctrl.is_crouching
-        
-        # Atualiza movimentação horizontal suave
-        move_val = input_ctrl.move_x
-        if abs(move_val) > 0.05:
-            self.x += move_val * VELOCIDADE_VACA
+        # 1. Trata evento de mudança de trilha
+        shift = input_ctrl.lane_shift_event
+        if shift != 0:
+            if shift == -1 and self.current_lane > 0:
+                self.current_lane -= 1
+            elif shift == +1 and self.current_lane < NUM_LANES - 1:
+                self.current_lane += 1
+            # Se já estiver no limite esquerdo (0) ou direito (2), não faz nada!
+            
+            self.target_x = self._calcular_x_da_trilha(self.current_lane)
+            input_ctrl.lane_shift_event = 0  # Consome o evento
+
+        # 2. Deslocamento suave e ágil em direção à trilha alvo (Slide / Lerp)
+        diff_x = self.target_x - self.x
+        if abs(diff_x) > 1.5:
+            self.x += diff_x * 0.26  # Transição rápida e fluida
             self.is_moving = True
         else:
+            self.x = self.target_x
             self.is_moving = False
 
-        # Limita a vaca estritamente aos anéis de Saturno
-        limite_min = BASE_X_MIN + 10
-        limite_max = BASE_X_MAX - LARGURA_VACA_NORMAL - 10
-        if self.x < limite_min:
-            self.x = limite_min
-        elif self.x > limite_max:
-            self.x = limite_max
+        # 3. Estado de agachamento
+        self.is_crouching = input_ctrl.is_crouching
 
-        # Controle de animação:
-        # Quando parada (idle), permanece no frame estável (0) sem tremer!
+        # 4. Controle de animação:
         if self.is_moving:
             self.frame_index = (self.frame_index + self.anim_speed) % len(self.frames_andar)
         else:
@@ -347,6 +474,64 @@ class DisplayManager:
 
 
 # =========================================================
+# TABELA / PAINEL DE DEBUG EM TEMPO REAL
+# =========================================================
+def desenhar_tabela_debug(canvas, input_ctrl, vaca=None, fps=60.0):
+    """Renderiza um painel com tabela de telemetria do ESP32 e do Player."""
+    if not input_ctrl.show_debug:
+        return
+
+    painel_w, painel_h = 380, 275
+    painel_x = LARGURA_VIRTUAL - painel_w - 20
+    painel_y = 20
+
+    painel_bg = pygame.Surface((painel_w, painel_h), pygame.SRCALPHA)
+    painel_bg.fill((12, 16, 28, 225))
+    pygame.draw.rect(painel_bg, (0, 180, 255), (0, 0, painel_w, painel_h), 2, border_radius=8)
+    canvas.blit(painel_bg, (painel_x, painel_y))
+
+    fonte_tit = pygame.font.SysFont("Courier New", 14, bold=True)
+    fonte_txt = pygame.font.SysFont("Courier New", 13, bold=True)
+
+    # Cabeçalho
+    txt_tit = fonte_tit.render("== DEBUG ESP32 / 3 TRILHAS ==", True, (255, 220, 80))
+    canvas.blit(txt_tit, (painel_x + 15, painel_y + 10))
+    pygame.draw.line(canvas, (0, 180, 255), (painel_x + 10, painel_y + 30), (painel_x + painel_w - 10, painel_y + 30), 1)
+
+    # Dados da Tabela
+    status_cor = (80, 255, 120) if input_ctrl.esp32_connected else (255, 90, 90)
+    status_str = f"CONECTADO ({input_ctrl.active_port_name})" if input_ctrl.esp32_connected else "DESCONECTADO"
+    crouch_str = "DESATIVADO (Flag)" if not ENABLE_CROUCH else ("SIM (Agachado)" if input_ctrl.is_crouching else "NAO (Em Pe)")
+    crouch_cor = (160, 160, 170) if not ENABLE_CROUCH else ((80, 255, 120) if input_ctrl.is_crouching else (180, 180, 190))
+    gatilho_str = "ARMADO (Pronto)" if input_ctrl.accel_armed else "BLOQUEADO (Cooldown)"
+    gatilho_cor = (80, 255, 120) if input_ctrl.accel_armed else (255, 200, 80)
+
+    trilha_nome = NOME_TRILHAS[vaca.current_lane] if vaca else "N/A"
+
+    linhas = [
+        ("Status:", status_str, status_cor),
+        ("Trilha da Vaca:", trilha_nome, (255, 255, 100)),
+        ("Accel Lateral Ay:", f"{input_ctrl.raw_ay:+.3f} G (Esq / Dir)", (100, 230, 255)),
+        ("Sensibilidade:", f"±{input_ctrl.accel_trigger_thresh:.3f} G (Alta)", (255, 200, 80)),
+        ("Gatilho Passo:", gatilho_str, gatilho_cor),
+        ("Agachamento:", crouch_str, crouch_cor),
+        ("FPS:", f"{fps:.1f}", (180, 220, 255)),
+    ]
+
+    curr_y = painel_y + 38
+    for label, val, cor in linhas:
+        t_lbl = fonte_txt.render(label, True, (160, 180, 210))
+        t_val = fonte_txt.render(val, True, cor)
+        canvas.blit(t_lbl, (painel_x + 15, curr_y))
+        canvas.blit(t_val, (painel_x + 160, curr_y))
+        curr_y += 22
+
+    # Rodapé com dica de alternância
+    t_dica = fonte_tit.render("[TAB] Ocultar/Exibir Tabela", True, (120, 145, 175))
+    canvas.blit(t_dica, (painel_x + 15, painel_y + painel_h - 22))
+
+
+# =========================================================
 # TELA INICIAL
 # =========================================================
 def tela_inicial(display_mgr, input_ctrl):
@@ -370,6 +555,8 @@ def tela_inicial(display_mgr, input_ctrl):
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_f or event.key == pygame.K_F11:
                     display_mgr.toggle_fullscreen()
+                elif event.key == pygame.K_TAB:
+                    input_ctrl.show_debug = not input_ctrl.show_debug
                 elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                     esperando = False
                     
@@ -382,9 +569,19 @@ def tela_inicial(display_mgr, input_ctrl):
         display_mgr.virtual_screen.blit(fundo, (0, 0))
         display_mgr.virtual_screen.blit(botao, botao_rect)
         
-        # Dica de tela cheia
+        # Dica de tela cheia e status do controle
         txt_dica = fonte_dica.render("Pressione [F] para Tela Cheia | [Espaço] para Iniciar", True, (240, 240, 240))
         display_mgr.virtual_screen.blit(txt_dica, (LARGURA_VIRTUAL // 2 - txt_dica.get_width() // 2, ALTURA_VIRTUAL - 40))
+
+        # Status do ESP32 na tela inicial
+        if input_ctrl.esp32_connected:
+            badge_txt = fonte_dica.render("● CONTROLE ESP32 ATIVO", True, (80, 255, 120))
+        else:
+            badge_txt = fonte_dica.render("○ MODO TECLADO (Conecte o ESP32 a qualquer momento)", True, (200, 200, 220))
+        display_mgr.virtual_screen.blit(badge_txt, (30, 30))
+
+        # Tabela de Debug
+        desenhar_tabela_debug(display_mgr.virtual_screen, input_ctrl, None, clock.get_fps())
         
         display_mgr.render()
         clock.tick(FPS)
@@ -405,6 +602,7 @@ def loop_gameplay(display_mgr, input_ctrl, frames_andar, frames_agachar, imagem_
     game_over = False
     
     fonte_hud = pygame.font.SysFont("Arial", 28, bold=True)
+    fonte_hud_status = pygame.font.SysFont("Arial", 16, bold=True)
     fonte_go_grande = pygame.font.SysFont("Arial", 64, bold=True)
     fonte_go_sub = pygame.font.SysFont("Arial", 26)
     
@@ -420,6 +618,8 @@ def loop_gameplay(display_mgr, input_ctrl, frames_andar, frames_agachar, imagem_
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_f or event.key == pygame.K_F11:
                     display_mgr.toggle_fullscreen()
+                elif event.key == pygame.K_TAB:
+                    input_ctrl.show_debug = not input_ctrl.show_debug
                 elif event.key == pygame.K_ESCAPE:
                     return True  # Volta para o menu
                 elif game_over:
@@ -485,18 +685,24 @@ def loop_gameplay(display_mgr, input_ctrl, frames_andar, frames_agachar, imagem_
         # Desenha a Vaca
         vaca.draw(canvas)
 
-        # HUD (Pontuação e Distância)
-        hud_bg = pygame.Surface((310, 85), pygame.SRCALPHA)
-        hud_bg.fill((20, 20, 35, 180))
+        # HUD (Pontuação, Distância e Status do Sensor)
+        hud_bg = pygame.Surface((310, 105), pygame.SRCALPHA)
+        hud_bg.fill((20, 20, 35, 190))
         canvas.blit(hud_bg, (20, 20))
         
         txt_score = fonte_hud.render(f"PONTOS: {int(pontuacao)}", True, (255, 230, 90))
         txt_dist = fonte_hud.render(f"DISTÂNCIA: {int(distancia)}m", True, (255, 255, 255))
-        canvas.blit(txt_score, (35, 28))
-        canvas.blit(txt_dist, (35, 62))
+        canvas.blit(txt_score, (35, 26))
+        canvas.blit(txt_dist, (35, 56))
+
+        if input_ctrl.esp32_connected:
+            txt_status = fonte_hud_status.render("● ESP32 CONECTADO", True, (80, 255, 120))
+        else:
+            txt_status = fonte_hud_status.render("○ CONTROLE: TECLADO", True, (190, 190, 210))
+        canvas.blit(txt_status, (35, 86))
 
         # Feedback de Agachamento no HUD
-        if vaca.is_crouching:
+        if ENABLE_CROUCH and vaca.is_crouching:
             txt_crouch = fonte_go_sub.render("AGACHADO", True, (100, 255, 120))
             canvas.blit(txt_crouch, (350, 30))
 
@@ -516,6 +722,9 @@ def loop_gameplay(display_mgr, input_ctrl, frames_andar, frames_agachar, imagem_
             canvas.blit(txt_sub1, (LARGURA_VIRTUAL // 2 - txt_sub1.get_width() // 2, 400))
             canvas.blit(txt_sub2, (LARGURA_VIRTUAL // 2 - txt_sub2.get_width() // 2, 445))
 
+        # Tabela de Debug (Telemetria ao vivo do ESP32)
+        desenhar_tabela_debug(canvas, input_ctrl, vaca, clock.get_fps())
+
         # 5. Apresenta o Frame
         display_mgr.render()
         clock.tick(FPS)
@@ -533,8 +742,8 @@ def main():
     display_mgr = DisplayManager()
     input_ctrl = InputController()
 
-    # Inicia conexão opcional com ESP32 (não bloqueante)
-    # input_ctrl.start_esp32_connection(port="/dev/cu.ESP32_COW")
+    # Inicia conexão em segundo plano com ESP32 (auto-detecta porta USB/Serial sem travar o jogo)
+    input_ctrl.start_esp32_connection(port="auto")
 
     # Carrega os assets otimizados
     frames_andar, frames_agachar = carregar_sprites_vaca()

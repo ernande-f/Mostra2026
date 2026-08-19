@@ -78,12 +78,16 @@ class InputController:
         self.esp32_port = "auto"
         self.esp32_baudrate = 115200
         
-        # Limiares de ALTA SENSIBILIDADE (Disparo Rápido com Aceleração Leve)
-        self.accel_trigger_thresh = 0.07  # Gs para disparar a troca de trilha (Alta Sensibilidade)
-        self.accel_reset_thresh = 0.035   # Gs para rearmar o gatilho
-        self.accel_armed = True
+        # Calibração e Filtro Dinâmico de Aceleração (Alta Precisão Bluetooth e USB)
+        self.accel_trigger_thresh = 0.28  # Gs dinâmicos para disparar (Ágil e Firme)
+        self.shift_cooldown = 0.25        # Cooldown estrito de 250ms
         self.last_shift_time = 0.0
-        self.shift_cooldown = 0.16        # Cooldown mínimo rápido em segundos
+        self.gravity_lateral = 0.0        # Linha de base da gravidade estática
+        self.dynamic_ay = 0.0             # Aceleração puramente dinâmica do movimento
+        self.peak_ay = 0.0                # Rastreia o pico dinâmico recente
+        
+        self.last_packet_time = 0.0
+        self.wifi_thread = None
         
         # Debounce do teclado
         self.prev_k_left = False
@@ -117,127 +121,182 @@ class InputController:
             self.is_crouching = False
 
     def start_esp32_connection(self, port="auto", baudrate=115200):
-        """Inicia a leitura em segundo plano dos dados do ESP32."""
+        """Inicia a escuta sem fio via Wi-Fi UDP e USB Serial simultaneamente."""
         self.esp32_port = port
         self.esp32_baudrate = baudrate
         self.esp32_running = True
+        
+        # 1. Thread Wi-Fi UDP (Ultra rápida < 2ms)
+        self.wifi_thread = threading.Thread(target=self._wifi_worker, daemon=True)
+        self.wifi_thread.start()
+
+        # 2. Thread USB Serial (Fallback)
         self.esp32_thread = threading.Thread(target=self._esp32_worker, daemon=True)
         self.esp32_thread.start()
 
-    def _find_esp32_port(self):
-        """Tenta encontrar automaticamente a porta do ESP32 no macOS/Linux/Windows."""
+    def _process_sensor_line(self, linha, source_name="ESP32"):
+        """Decodifica o pacote e executa o filtro dinâmico de troca de trilha."""
+        partes = [p.strip() for p in linha.split(',') if p.strip()]
+        if len(partes) >= 1:
+            try:
+                if len(partes) == 1:
+                    ay = float(partes[0])
+                    ax = 0.0
+                    az = 1.0
+                    crouch = 0
+                elif len(partes) == 3:
+                    ax = float(partes[0])
+                    ay = float(partes[1])
+                    az = float(partes[2])
+                    crouch = 0
+                elif len(partes) == 4:
+                    ax = float(partes[0])
+                    ay = float(partes[1])
+                    az = float(partes[2])
+                    crouch = int(partes[3])
+                elif len(partes) >= 6:
+                    crouch = int(partes[2])
+                    ax = float(partes[3])
+                    ay = float(partes[4])
+                    az = float(partes[5])
+                else:
+                    ay = float(partes[0])
+                    ax = 0.0
+                    az = 1.0
+                    crouch = 0
+                
+                self.raw_ax = ax
+                self.raw_ay = ay
+                self.raw_az = az
+                self.raw_crouch = crouch
+
+                # Registra sucesso da conexão
+                self.esp32_connected = True
+                self.active_port_name = source_name
+                self.last_packet_time = time.time()
+
+                # Eixo lateral dominante
+                val_raw = ay if abs(ay) >= abs(ax) else ax
+
+                # Filtro Passa-Alta calibrado
+                self.gravity_lateral = 0.95 * self.gravity_lateral + 0.05 * val_raw
+                self.dynamic_ay = val_raw - self.gravity_lateral
+
+                # Medidor de pico dinâmico
+                self.peak_ay = max(self.peak_ay * 0.95, abs(self.dynamic_ay))
+
+                # Disparo por Cooldown Estrito (250ms)
+                agora = time.time()
+                tempo_passado = agora - self.last_shift_time
+
+                if tempo_passado >= self.shift_cooldown:
+                    if self.dynamic_ay > self.accel_trigger_thresh:
+                        self.lane_shift_event = +1
+                        self.last_shift_time = agora
+                    elif self.dynamic_ay < -self.accel_trigger_thresh:
+                        self.lane_shift_event = -1
+                        self.last_shift_time = agora
+
+                self.is_crouching = bool(crouch) if ENABLE_CROUCH else False
+            except ValueError:
+                pass
+
+    def _wifi_worker(self):
+        """Escuta pacotes de acelerômetro transmitidos via Wi-Fi UDP Broadcast (Porta 4210)."""
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            import serial.tools.list_ports
-            ports = list(serial.tools.list_ports.comports())
-            for p in ports:
-                name = p.device.lower()
-                desc = (p.description or "").lower()
-                if any(k in name or k in desc for k in [
-                    "usbserial", "wchusbserial", "slab_usbtouart", "usbmodem", 
-                    "cp210", "ch340", "ftdi", "esp32"
-                ]):
-                    return p.device
-            for p in ports:
-                if "cu.usb" in p.device.lower() or "ttyusb" in p.device.lower():
-                    return p.device
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind(("", 4210))
+            sock.settimeout(0.5)
+            print("[WI-FI] Receptor UDP iniciado na porta 4210 (Aguardando ESP32_COW_GAME)...")
         except Exception as e:
-            print(f"[DEBUG] Erro ao listar portas: {e}")
-        return None
+            print(f"[WI-FI] Aviso: Não foi possível abrir porta UDP 4210: {e}")
+            return
+
+        while self.esp32_running:
+            try:
+                data, addr = sock.recvfrom(1024)
+                if data:
+                    linha = data.decode('utf-8', errors='ignore').strip()
+                    if linha:
+                        self._process_sensor_line(linha, source_name=f"Wi-Fi [{addr[0]}]")
+            except socket.timeout:
+                if self.active_port_name.startswith("Wi-Fi") and (time.time() - self.last_packet_time > 2.5):
+                    self.esp32_connected = False
+                    self.active_port_name = "Procurando Wi-Fi..."
+            except Exception:
+                time.sleep(0.05)
+
+    def _get_candidate_ports(self):
+        """Retorna uma lista ordenada de portas seriais USB válidas."""
+        candidatas = []
+        blacklist = ["incoming-port", "wlan-debug", "debug-console", "airpods", "headset", "iphone", "watch", "soc"]
+
+        try:
+            import glob
+            devs = glob.glob('/dev/cu.*')
+            for d in devs:
+                d_low = d.lower()
+                if any(b in d_low for b in blacklist):
+                    continue
+                if any(k in d_low for k in ["esp32", "cow", "usbserial", "wchusbserial", "slab_usbtouart", "usbmodem", "cp210", "ch340", "ftdi"]):
+                    if d not in candidatas:
+                        candidatas.append(d)
+        except Exception as e:
+            print(f"[DEBUG] Erro scan glob: {e}")
+
+        return candidatas
 
     def _esp32_worker(self):
-        """Thread resiliente de alta sensibilidade para impulsos laterais."""
+        """Thread para conexão com ESP32 via Cabo USB Serial."""
         try:
             import serial
         except ImportError:
-            print("[AVISO] Pacote 'pyserial' não instalado. Execute: pip install pyserial")
             return
 
-        logged_search = False
         while self.esp32_running:
-            target_port = self.esp32_port
-            if target_port == "auto" or target_port is None:
-                target_port = self._find_esp32_port()
-
-            if not target_port:
-                if not logged_search:
-                    print("[ESP32] Procurando porta USB do ESP32... (Você pode jogar no teclado normalmente)")
-                    logged_search = True
-                self.esp32_connected = False
-                self.active_port_name = "Nenhuma"
-                time.sleep(1.5)
+            # Se já está recebendo dados ativos via Wi-Fi, aguarda
+            if self.esp32_connected and self.active_port_name.startswith("Wi-Fi"):
+                time.sleep(1.0)
                 continue
 
-            try:
-                print(f"[ESP32] Conectando na porta: {target_port} ...")
-                with serial.Serial(target_port, self.esp32_baudrate, timeout=0.5) as ser:
-                    self.esp32_connected = True
-                    self.active_port_name = target_port.split('/')[-1]
-                    print(f"\n=======================================================")
-                    print(f"  [ESP32] CONECTADO COM SUCESSO na porta {target_port}!")
-                    print(f"=======================================================\n")
-                    
-                    while self.esp32_running:
-                        linha = ser.readline().decode('utf-8', errors='ignore').strip()
-                        if linha:
-                            partes = [p.strip() for p in linha.split(',') if p.strip()]
-                            if len(partes) >= 1:
-                                try:
-                                    if len(partes) == 1:
-                                        # Formato puro de alta sensibilidade: AY
-                                        ay = float(partes[0])
-                                        ax = 0.0
-                                        az = 1.0
-                                        crouch = 0
-                                    elif len(partes) == 4:
-                                        # Formato AX, AY, AZ, CROUCH
-                                        ax = float(partes[0])
-                                        ay = float(partes[1])
-                                        az = float(partes[2])
-                                        crouch = int(partes[3])
-                                    elif len(partes) >= 6:
-                                        # Formato estendido: ROLL, PITCH, CROUCH, AX, AY, AZ
-                                        crouch = int(partes[2])
-                                        ax = float(partes[3])
-                                        ay = float(partes[4])
-                                        az = float(partes[5])
-                                    else:
-                                        ay = float(partes[0])
-                                        ax = 0.0
-                                        az = 1.0
-                                        crouch = 0
-                                    
-                                    self.raw_ax = ax
-                                    self.raw_ay = ay
-                                    self.raw_az = az
-                                    self.raw_crouch = crouch
+            if self.esp32_port and self.esp32_port != "auto":
+                portas = [self.esp32_port]
+            else:
+                portas = self._get_candidate_ports()
 
-                                    # Detecção de Alta Sensibilidade por Aceleração Positiva / Negativa
-                                    agora = time.time()
-                                    if self.accel_armed and (agora - self.last_shift_time > self.shift_cooldown):
-                                        if ay > self.accel_trigger_thresh:
-                                            # Aceleração Positiva -> Mover para a Direita
-                                            self.lane_shift_event = +1
-                                            self.accel_armed = False
-                                            self.last_shift_time = agora
-                                        elif ay < -self.accel_trigger_thresh:
-                                            # Aceleração Negativa -> Mover para a Esquerda
-                                            self.lane_shift_event = -1
-                                            self.accel_armed = False
-                                            self.last_shift_time = agora
-                                    elif abs(ay) < self.accel_reset_thresh:
-                                        # Quando volta próximo a zero, rearma o gatilho imediatamente
-                                        self.accel_armed = True
+            if not portas:
+                if not self.esp32_connected:
+                    self.active_port_name = "Aguardando Wi-Fi ou USB..."
+                time.sleep(1.0)
+                continue
 
-                                    self.is_crouching = bool(crouch) if ENABLE_CROUCH else False
-                                except ValueError:
-                                    pass
-            except Exception as e:
-                self.esp32_connected = False
-                self.active_port_name = "Erro de Conexão"
-                err_str = str(e).lower()
-                if "busy" in err_str or "resource" in err_str or "permission" in err_str:
-                    print(f"[AVISO ESP32] A porta {target_port} está ocupada. FECHE o Serial Monitor do Arduino IDE!")
-                time.sleep(2.0)
+            conectado = False
+            for target_port in portas:
+                if not self.esp32_running or (self.esp32_connected and self.active_port_name.startswith("Wi-Fi")):
+                    break
+                try:
+                    with serial.Serial(target_port, self.esp32_baudrate, timeout=1.0) as ser:
+                        while self.esp32_running:
+                            if self.esp32_connected and self.active_port_name.startswith("Wi-Fi"):
+                                break
+                            try:
+                                if ser.in_waiting > 120:
+                                    ser.reset_input_buffer()
+                            except Exception:
+                                pass
+                            
+                            linha = ser.readline().decode('utf-8', errors='ignore').strip()
+                            if linha:
+                                self._process_sensor_line(linha, source_name=f"USB ({target_port.split('/')[-1]})")
+                                conectado = True
+                except Exception:
+                    continue
+            
+            if not conectado and not self.esp32_connected:
+                time.sleep(1.0)
 
 
 # =========================================================
@@ -481,7 +540,7 @@ def desenhar_tabela_debug(canvas, input_ctrl, vaca=None, fps=60.0):
     if not input_ctrl.show_debug:
         return
 
-    painel_w, painel_h = 380, 275
+    painel_w, painel_h = 380, 295
     painel_x = LARGURA_VIRTUAL - painel_w - 20
     painel_y = 20
 
@@ -500,20 +559,23 @@ def desenhar_tabela_debug(canvas, input_ctrl, vaca=None, fps=60.0):
 
     # Dados da Tabela
     status_cor = (80, 255, 120) if input_ctrl.esp32_connected else (255, 90, 90)
-    status_str = f"CONECTADO ({input_ctrl.active_port_name})" if input_ctrl.esp32_connected else "DESCONECTADO"
+    status_str = f"CONECTADO [{input_ctrl.active_port_name}]" if input_ctrl.esp32_connected else f"BUSCANDO ({input_ctrl.active_port_name})"
     crouch_str = "DESATIVADO (Flag)" if not ENABLE_CROUCH else ("SIM (Agachado)" if input_ctrl.is_crouching else "NAO (Em Pe)")
     crouch_cor = (160, 160, 170) if not ENABLE_CROUCH else ((80, 255, 120) if input_ctrl.is_crouching else (180, 180, 190))
-    gatilho_str = "ARMADO (Pronto)" if input_ctrl.accel_armed else "BLOQUEADO (Cooldown)"
-    gatilho_cor = (80, 255, 120) if input_ctrl.accel_armed else (255, 200, 80)
+    tempo_passado = time.time() - input_ctrl.last_shift_time
+    pronto = tempo_passado >= input_ctrl.shift_cooldown
+    gatilho_str = "ARMADO (Pronto)" if pronto else f"COOLDOWN ({(input_ctrl.shift_cooldown - tempo_passado):.2f}s)"
+    gatilho_cor = (80, 255, 120) if pronto else (255, 200, 80)
 
     trilha_nome = NOME_TRILHAS[vaca.current_lane] if vaca else "N/A"
 
     linhas = [
         ("Status:", status_str, status_cor),
         ("Trilha da Vaca:", trilha_nome, (255, 255, 100)),
-        ("Accel Lateral Ay:", f"{input_ctrl.raw_ay:+.3f} G (Esq / Dir)", (100, 230, 255)),
-        ("Sensibilidade:", f"±{input_ctrl.accel_trigger_thresh:.3f} G (Alta)", (255, 200, 80)),
-        ("Gatilho Passo:", gatilho_str, gatilho_cor),
+        ("Accel Dinamica:", f"{input_ctrl.dynamic_ay:+.3f} G", (100, 230, 255)),
+        ("Pico Dinamico:", f"{input_ctrl.peak_ay:.3f} G", (255, 180, 220)),
+        ("Limiar Disparo:", f"±{input_ctrl.accel_trigger_thresh:.2f} G", (255, 200, 80)),
+        ("Status Gatilho:", gatilho_str, gatilho_cor),
         ("Agachamento:", crouch_str, crouch_cor),
         ("FPS:", f"{fps:.1f}", (180, 220, 255)),
     ]
@@ -575,9 +637,10 @@ def tela_inicial(display_mgr, input_ctrl):
 
         # Status do ESP32 na tela inicial
         if input_ctrl.esp32_connected:
-            badge_txt = fonte_dica.render("● CONTROLE ESP32 ATIVO", True, (80, 255, 120))
+            tipo_con = "BLUETOOTH" if any(k in input_ctrl.active_port_name.lower() for k in ["esp32", "cow", "bluetooth"]) else "USB"
+            badge_txt = fonte_dica.render(f"● ESP32 {tipo_con} ATIVO", True, (80, 255, 120))
         else:
-            badge_txt = fonte_dica.render("○ MODO TECLADO (Conecte o ESP32 a qualquer momento)", True, (200, 200, 220))
+            badge_txt = fonte_dica.render("○ MODO TECLADO (Conecte via Bluetooth ou USB)", True, (200, 200, 220))
         display_mgr.virtual_screen.blit(badge_txt, (30, 30))
 
         # Tabela de Debug
@@ -591,145 +654,145 @@ def tela_inicial(display_mgr, input_ctrl):
 # LOOP PRINCIPAL DA GAMEPLAY
 # =========================================================
 def loop_gameplay(display_mgr, input_ctrl, frames_andar, frames_agachar, imagem_cenario, imagem_caixa):
-    vaca = VacaPlayer(frames_andar, frames_agachar)
-    caixas = []
-    
-    spawn_timer = 0
-    spawn_intervalo = 48
-    pontuacao = 0.0
-    distancia = 0.0
-    multiplicador_dificuldade = 1.0
-    game_over = False
-    
     fonte_hud = pygame.font.SysFont("Arial", 28, bold=True)
     fonte_hud_status = pygame.font.SysFont("Arial", 16, bold=True)
     fonte_go_grande = pygame.font.SysFont("Arial", 64, bold=True)
     fonte_go_sub = pygame.font.SysFont("Arial", 26)
-    
     clock = pygame.time.Clock()
-    running = True
 
-    while running:
-        # 1. Trata Eventos
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return False  # Sair do jogo
-                
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_f or event.key == pygame.K_F11:
-                    display_mgr.toggle_fullscreen()
-                elif event.key == pygame.K_TAB:
-                    input_ctrl.show_debug = not input_ctrl.show_debug
-                elif event.key == pygame.K_ESCAPE:
-                    return True  # Volta para o menu
-                elif game_over:
-                    if event.key in (pygame.K_r, pygame.K_SPACE, pygame.K_RETURN):
-                        # Reinicia a partida imediatamente
-                        return loop_gameplay(display_mgr, input_ctrl, frames_andar, frames_agachar, imagem_cenario, imagem_caixa)
-
-        # 2. Atualiza Entradas
-        keys = pygame.key.get_pressed()
-        input_ctrl.update_from_keyboard(keys)
-
-        # 3. Lógica do Jogo
-        if not game_over:
-            distancia += 0.35 * multiplicador_dificuldade
-            pontuacao += 1.0 * multiplicador_dificuldade
-            
-            # Aceleração sutil e progressiva de dificuldade
-            multiplicador_dificuldade = min(2.0, 1.0 + (distancia / 1500.0))
-            spawn_intervalo_atual = max(24, int(spawn_intervalo / multiplicador_dificuldade))
-            
-            # Geração de caixas
-            spawn_timer += 1
-            if spawn_timer >= spawn_intervalo_atual:
-                caixas.append(criar_obstaculo(velocidade_base=multiplicador_dificuldade))
-                spawn_timer = 0
-
-            # Atualiza Vaca
-            vaca.update(input_ctrl)
-            hitbox_vaca = vaca.get_hitbox()
-
-            # Atualiza Caixas ao longo da curvatura dos anéis
-            for caixa in caixas:
-                caixa['progresso_y'] += caixa['velocidade']
-
-            # Remove caixas que saíram da tela
-            caixas = [c for c in caixas if c['progresso_y'] < 1.35]
-
-            # Checagem de Colisão
-            for caixa in caixas:
-                if caixa['progresso_y'] > 0.0:
-                    cx, cy, c_tam = calcular_posicao_pista(caixa['progresso_y'], caixa['lane'])
-                    caixa_rect = pygame.Rect(cx - c_tam // 2, cy - c_tam // 2, c_tam, c_tam)
-                    # Hitbox ajustada do obstáculo
-                    caixa_hitbox = caixa_rect.inflate(-c_tam * 0.35, -c_tam * 0.35)
+    # Loop de Partidas (Permite jogar e reiniciar infinitamente sem recursão de memória)
+    while True:
+        vaca = VacaPlayer(frames_andar, frames_agachar)
+        caixas = []
+        
+        spawn_timer = 0
+        spawn_intervalo = 48
+        pontuacao = 0.0
+        distancia = 0.0
+        multiplicador_dificuldade = 1.0
+        game_over = False
+        
+        partida_ativa = True
+        while partida_ativa:
+            # 1. Trata Eventos
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False  # Fecha o jogo
                     
-                    if hitbox_vaca.colliderect(caixa_hitbox):
-                        game_over = True
-                        break
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_f or event.key == pygame.K_F11:
+                        display_mgr.toggle_fullscreen()
+                    elif event.key == pygame.K_TAB:
+                        input_ctrl.show_debug = not input_ctrl.show_debug
+                    elif event.key == pygame.K_ESCAPE:
+                        return True  # Volta para o menu inicial
+                    elif game_over:
+                        if event.key in (pygame.K_r, pygame.K_SPACE, pygame.K_RETURN):
+                            # Reinicia uma nova partida limpamente
+                            partida_ativa = False
 
-        # 4. Renderização no Canvas Virtual
-        canvas = display_mgr.virtual_screen
-        
-        # Cenário de fundo
-        canvas.blit(imagem_cenario, (0, 0))
+            # 2. Atualiza Entradas
+            keys = pygame.key.get_pressed()
+            input_ctrl.update_from_keyboard(keys)
 
-        # Desenha os obstáculos em perspectiva curva
-        for caixa in caixas:
-            if caixa['progresso_y'] > -0.05:
-                cx, cy, c_tam = calcular_posicao_pista(caixa['progresso_y'], caixa['lane'])
-                caixa_scaled = pygame.transform.smoothscale(imagem_caixa, (c_tam, c_tam))
-                canvas.blit(caixa_scaled, (int(cx - c_tam / 2), int(cy - c_tam / 2)))
+            # 3. Lógica do Jogo
+            if not game_over:
+                distancia += 0.35 * multiplicador_dificuldade
+                pontuacao += 1.0 * multiplicador_dificuldade
+                
+                # Aceleração sutil e progressiva de dificuldade
+                multiplicador_dificuldade = min(2.0, 1.0 + (distancia / 1500.0))
+                spawn_intervalo_atual = max(24, int(spawn_intervalo / multiplicador_dificuldade))
+                
+                # Geração de caixas
+                spawn_timer += 1
+                if spawn_timer >= spawn_intervalo_atual:
+                    caixas.append(criar_obstaculo(velocidade_base=multiplicador_dificuldade))
+                    spawn_timer = 0
 
-        # Desenha a Vaca
-        vaca.draw(canvas)
+                # Atualiza Vaca
+                vaca.update(input_ctrl)
+                hitbox_vaca = vaca.get_hitbox()
 
-        # HUD (Pontuação, Distância e Status do Sensor)
-        hud_bg = pygame.Surface((310, 105), pygame.SRCALPHA)
-        hud_bg.fill((20, 20, 35, 190))
-        canvas.blit(hud_bg, (20, 20))
-        
-        txt_score = fonte_hud.render(f"PONTOS: {int(pontuacao)}", True, (255, 230, 90))
-        txt_dist = fonte_hud.render(f"DISTÂNCIA: {int(distancia)}m", True, (255, 255, 255))
-        canvas.blit(txt_score, (35, 26))
-        canvas.blit(txt_dist, (35, 56))
+                # Atualiza Caixas ao longo da curvatura dos anéis
+                for caixa in caixas:
+                    caixa['progresso_y'] += caixa['velocidade']
 
-        if input_ctrl.esp32_connected:
-            txt_status = fonte_hud_status.render("● ESP32 CONECTADO", True, (80, 255, 120))
-        else:
-            txt_status = fonte_hud_status.render("○ CONTROLE: TECLADO", True, (190, 190, 210))
-        canvas.blit(txt_status, (35, 86))
+                # Remove caixas que saíram da tela
+                caixas = [c for c in caixas if c['progresso_y'] < 1.35]
 
-        # Feedback de Agachamento no HUD
-        if ENABLE_CROUCH and vaca.is_crouching:
-            txt_crouch = fonte_go_sub.render("AGACHADO", True, (100, 255, 120))
-            canvas.blit(txt_crouch, (350, 30))
+                # Checagem de Colisão
+                for caixa in caixas:
+                    if caixa['progresso_y'] > 0.0:
+                        cx, cy, c_tam = calcular_posicao_pista(caixa['progresso_y'], caixa['lane'])
+                        caixa_rect = pygame.Rect(cx - c_tam // 2, cy - c_tam // 2, c_tam, c_tam)
+                        # Hitbox ajustada do obstáculo
+                        caixa_hitbox = caixa_rect.inflate(-c_tam * 0.35, -c_tam * 0.35)
+                        
+                        if hitbox_vaca.colliderect(caixa_hitbox):
+                            game_over = True
+                            break
 
-        # Tela de Game Over
-        if game_over:
-            overlay = pygame.Surface((LARGURA_VIRTUAL, ALTURA_VIRTUAL), pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 190))
-            canvas.blit(overlay, (0, 0))
+            # 4. Renderização no Canvas Virtual
+            canvas = display_mgr.virtual_screen
+            
+            # Cenário de fundo
+            canvas.blit(imagem_cenario, (0, 0))
 
-            txt_go = fonte_go_grande.render("GAME OVER", True, (255, 60, 60))
-            txt_score_final = fonte_hud.render(f"Pontuação Final: {int(pontuacao)}", True, (255, 255, 255))
-            txt_sub1 = fonte_go_sub.render("Pressione [R] ou [ESPAÇO] para Jogar Novamente", True, (240, 240, 240))
-            txt_sub2 = fonte_go_sub.render("Pressione [ESC] para Voltar ao Menu Inicial", True, (180, 180, 180))
+            # Desenha os obstáculos em perspectiva curva
+            for caixa in caixas:
+                if caixa['progresso_y'] > -0.05:
+                    cx, cy, c_tam = calcular_posicao_pista(caixa['progresso_y'], caixa['lane'])
+                    caixa_scaled = pygame.transform.smoothscale(imagem_caixa, (c_tam, c_tam))
+                    canvas.blit(caixa_scaled, (int(cx - c_tam / 2), int(cy - c_tam / 2)))
 
-            canvas.blit(txt_go, (LARGURA_VIRTUAL // 2 - txt_go.get_width() // 2, 220))
-            canvas.blit(txt_score_final, (LARGURA_VIRTUAL // 2 - txt_score_final.get_width() // 2, 310))
-            canvas.blit(txt_sub1, (LARGURA_VIRTUAL // 2 - txt_sub1.get_width() // 2, 400))
-            canvas.blit(txt_sub2, (LARGURA_VIRTUAL // 2 - txt_sub2.get_width() // 2, 445))
+            # Desenha a Vaca
+            vaca.draw(canvas)
 
-        # Tabela de Debug (Telemetria ao vivo do ESP32)
-        desenhar_tabela_debug(canvas, input_ctrl, vaca, clock.get_fps())
+            # HUD (Pontuação, Distância e Status do Sensor)
+            hud_bg = pygame.Surface((310, 105), pygame.SRCALPHA)
+            hud_bg.fill((20, 20, 35, 190))
+            canvas.blit(hud_bg, (20, 20))
+            
+            txt_score = fonte_hud.render(f"PONTOS: {int(pontuacao)}", True, (255, 230, 90))
+            txt_dist = fonte_hud.render(f"DISTÂNCIA: {int(distancia)}m", True, (255, 255, 255))
+            canvas.blit(txt_score, (35, 26))
+            canvas.blit(txt_dist, (35, 56))
 
-        # 5. Apresenta o Frame
-        display_mgr.render()
-        clock.tick(FPS)
+            if input_ctrl.esp32_connected:
+                tipo_con = "BLUETOOTH" if any(k in input_ctrl.active_port_name.lower() for k in ["esp32", "cow", "bluetooth"]) else "USB"
+                txt_status = fonte_hud_status.render(f"● ESP32 {tipo_con} CONECTADO", True, (80, 255, 120))
+            else:
+                txt_status = fonte_hud_status.render("○ CONTROLE: TECLADO", True, (190, 190, 210))
+            canvas.blit(txt_status, (35, 86))
 
-    return False
+            # Feedback de Agachamento no HUD
+            if ENABLE_CROUCH and vaca.is_crouching:
+                txt_crouch = fonte_go_sub.render("AGACHADO", True, (100, 255, 120))
+                canvas.blit(txt_crouch, (350, 30))
+
+            # Tela de Game Over
+            if game_over:
+                overlay = pygame.Surface((LARGURA_VIRTUAL, ALTURA_VIRTUAL), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 190))
+                canvas.blit(overlay, (0, 0))
+
+                txt_go = fonte_go_grande.render("GAME OVER", True, (255, 60, 60))
+                txt_score_final = fonte_hud.render(f"Pontuação Final: {int(pontuacao)}", True, (255, 255, 255))
+                txt_sub1 = fonte_go_sub.render("Pressione [R] ou [ESPAÇO] para Jogar Novamente", True, (240, 240, 240))
+                txt_sub2 = fonte_go_sub.render("Pressione [ESC] para Voltar ao Menu Inicial", True, (180, 180, 180))
+
+                canvas.blit(txt_go, (LARGURA_VIRTUAL // 2 - txt_go.get_width() // 2, 220))
+                canvas.blit(txt_score_final, (LARGURA_VIRTUAL // 2 - txt_score_final.get_width() // 2, 310))
+                canvas.blit(txt_sub1, (LARGURA_VIRTUAL // 2 - txt_sub1.get_width() // 2, 400))
+                canvas.blit(txt_sub2, (LARGURA_VIRTUAL // 2 - txt_sub2.get_width() // 2, 445))
+
+            # Tabela de Debug (Telemetria ao vivo do ESP32)
+            desenhar_tabela_debug(canvas, input_ctrl, vaca, clock.get_fps())
+
+            # 5. Apresenta o Frame
+            display_mgr.render()
+            clock.tick(FPS)
 
 
 # =========================================================

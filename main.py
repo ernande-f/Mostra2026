@@ -535,13 +535,13 @@ def desenhar_tabela_debug(canvas, input_ctrl, vaca=None, fps=60.0):
 # TELA INICIAL
 # =========================================================
 def tela_inicial(display_mgr, input_ctrl):
-    fundo = pygame.image.load("Imagens/fundo_inicio.jpg").convert()
+    fundo = pygame.image.load("Imagens/fundo_inicio.gif").convert()
     fundo = pygame.transform.scale(fundo, (LARGURA_VIRTUAL, ALTURA_VIRTUAL))
     
     botao = pygame.image.load("Imagens/botao_inicio.png").convert_alpha()
-    botao = pygame.transform.scale(botao, (250, 90))
-    botao_rect = botao.get_rect(center=(int(LARGURA_VIRTUAL // 4.4), 593))
-    
+    botao = pygame.transform.scale(botao, (440, 67))
+    botao_rect = botao.get_rect(center=(450, 418))
+
     fonte_dica = pygame.font.SysFont("Arial", 22, bold=True)
     clock = pygame.time.Clock()
     

@@ -1,0 +1,2 @@
+{"id":"image_001","type":"image","path":".media/images/image_001.png","source":"ingested","description":"codex-clipboard-607bb110-861d-476f-9043-8a30c06a1c31.png","provenance":{"provider":"local","from":"/var/folders/1s/knz30csn4x76gbmhrm507frw0000gn/T/codex-clipboard-607bb110-861d-476f-9043-8a30c06a1c31.png"}}
+{"id":"video_001","type":"video","path":".media/video/video_001.webm","source":"ingested","description":"saturn-planet-loop-source.webm","provenance":{"provider":"local","from":"/tmp/saturn-planet-loop-source.webm"}}

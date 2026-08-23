@@ -1,0 +1,14 @@
+{
+  "duration": 8,
+  "assertions": [
+    {
+      "kind": "staysInFrame",
+      "selector": "#saturn-loop"
+    },
+    {
+      "kind": "keepsMoving",
+      "withinSelector": "#planet-sheen-clip",
+      "maxStaticSec": 1.5
+    }
+  ]
+}

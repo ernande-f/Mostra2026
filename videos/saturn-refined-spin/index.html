@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1668, height=943">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        width: 1668px;
+        height: 943px;
+        margin: 0;
+        overflow: hidden;
+        background: #111824;
+      }
+      #root {
+        position: relative;
+        width: 1668px;
+        height: 943px;
+        overflow: hidden;
+      }
+      #saturn-loop {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 1668px;
+        height: 943px;
+        object-fit: fill;
+        image-rendering: pixelated;
+      }
+      #planet-sheen-clip {
+        position: absolute;
+        inset: 0;
+        width: 1668px;
+        height: 943px;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      #planet-sheen {
+        position: absolute;
+        left: -110px;
+        top: 0;
+        display: block;
+        width: 760px;
+        height: 943px;
+        background: linear-gradient(
+          102deg,
+          transparent 36%,
+          rgba(255, 239, 185, 0.025) 43%,
+          rgba(255, 244, 204, 0.1) 49%,
+          rgba(255, 223, 135, 0.035) 55%,
+          transparent 63%
+        );
+        clip-path: ellipse(700px 610px at 110px 470px);
+        mix-blend-mode: screen;
+        opacity: 0.58;
+        will-change: transform, opacity;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      data-hf-id="hf-saturn-refined-root"
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="8"
+      data-width="1668"
+      data-height="943"
+    >
+      <video
+        data-hf-id="hf-saturn-refined-video"
+        id="saturn-loop"
+        class="clip"
+        src=".media/video/video_002.webm"
+        data-start="0"
+        data-duration="8"
+        data-track-index="0"
+        muted
+        playsinline
+        preload="auto"
+      ></video>
+      <div
+        data-hf-id="hf-saturn-sheen-clip"
+        id="planet-sheen-clip"
+      >
+        <div data-hf-id="hf-saturn-sheen" id="planet-sheen"></div>
+      </div>
+    </div>
+    <script>
+      const tl = gsap.timeline({ paused: true });
+      tl.fromTo(
+        "#planet-sheen",
+        { x: -90, opacity: 0.58 },
+        { x: 130, opacity: 0.82, duration: 4, ease: "sine.inOut" },
+        0,
+      ).to(
+        "#planet-sheen",
+        { x: -90, opacity: 0.58, duration: 4, ease: "sine.inOut" },
+        4,
+      );
+      window.__timelines = window.__timelines || {};
+      window.__timelines.main = tl;
+    </script>
+  </body>
+</html>

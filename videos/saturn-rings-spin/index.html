@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=708, height=400">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 708px;
+        height: 400px;
+        margin: 0;
+        overflow: hidden;
+        background: #181a28;
+      }
+
+      #root {
+        position: relative;
+        width: 708px;
+        height: 400px;
+        overflow: hidden;
+      }
+
+      #saturn-loop {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 708px;
+        height: 400px;
+        object-fit: fill;
+        image-rendering: pixelated;
+      }
+
+      #ring-glints {
+        position: absolute;
+        inset: 0;
+        width: 708px;
+        height: 400px;
+        pointer-events: none;
+      }
+
+      .ring-glint {
+        position: absolute;
+        display: block;
+        width: 2px;
+        height: 2px;
+        background: #fff1a8;
+        box-shadow:
+          -2px 0 0 rgba(244, 208, 92, 0.58),
+          2px 0 0 rgba(244, 208, 92, 0.58),
+          0 -2px 0 rgba(244, 208, 92, 0.42),
+          0 2px 0 rgba(244, 208, 92, 0.42),
+          0 0 7px rgba(255, 225, 120, 0.38);
+        opacity: 0;
+        will-change: opacity;
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-lq26" id="root" data-composition-id="main" data-start="0" data-duration="6" data-width="708" data-height="400">
+      <video data-hf-id="hf-uroi" id="saturn-loop" class="clip" src=".media/video/video_002.webm" data-start="0" data-duration="6" data-track-index="0" muted playsinline preload="auto"></video>
+
+      <div data-hf-id="hf-iyem" id="ring-glints" class="clip" data-start="0" data-duration="6" data-track-index="1" aria-hidden="true">
+        <i data-hf-id="hf-roxj" class="ring-glint" style="left: 354px; top: 113px"></i>
+        <i data-hf-id="hf-gu51" class="ring-glint" style="left: 411px; top: 139px"></i>
+        <i data-hf-id="hf-0fpo" class="ring-glint" style="left: 473px; top: 178px"></i>
+        <i data-hf-id="hf-8czi" class="ring-glint" style="left: 535px; top: 221px"></i>
+        <i data-hf-id="hf-x06p" class="ring-glint" style="left: 596px; top: 274px"></i>
+        <i data-hf-id="hf-my2z" class="ring-glint" style="left: 643px; top: 318px"></i>
+      </div>
+    </div>
+
+    <script>
+      const glints = Array.from(document.querySelectorAll(".ring-glint"));
+      const motion = { phase: 0 };
+      const tl = gsap.timeline({ paused: true });
+
+      function updateGlints(phase) {
+        glints.forEach((glint, index) => {
+          const localPhase = phase * 2 + index * 0.173;
+          const pulse = Math.max(0, Math.sin(localPhase * Math.PI * 2));
+          glint.style.opacity = String(Math.pow(pulse, 7) * (0.34 + index * 0.045));
+        });
+      }
+
+      updateGlints(0);
+
+      tl.to(
+        motion,
+        {
+          phase: 1,
+          duration: 6,
+          ease: "none",
+          onUpdate: () => updateGlints(motion.phase),
+        },
+        0,
+      );
+
+      window.__timelines = window.__timelines || {};
+      window.__timelines.main = tl;
+    </script>
+  </body>
+</html>

@@ -1,5 +1,10 @@
 import os
+import json
+import tempfile
 import unittest
+
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -85,6 +90,62 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
             self.assertFalse(cow.get_hitbox().colliderect(
                 main.calcular_hitbox_obstaculo(self.obstacle(kind, lane=2))
             ))
+
+    def test_obstacle_is_born_above_the_track_horizon(self):
+        obstacle = main.criar_obstaculo()
+        self.assertEqual(obstacle["progresso_y"], main.PROGRESSO_SPAWN)
+        _, y, _ = main.calcular_posicao_pista(obstacle["progresso_y"], obstacle["lane"])
+        self.assertLess(y, main.HORIZON_Y)
+        self.assertLessEqual(main.PROGRESSO_MINIMO_VISIVEL, -0.20)
+
+    def test_difficulty_changes_approach_speed(self):
+        with patch("main.random.uniform", return_value=0.012):
+            easy = main.criar_obstaculo(main.DIFICULDADES["FACIL"]["velocidade"])
+            hard = main.criar_obstaculo(main.DIFICULDADES["DIFICIL"]["velocidade"])
+        self.assertGreater(hard["velocidade"], easy["velocidade"] * 1.5)
+
+    def test_sensor_tilt_changes_lane_once_until_returning_to_center(self):
+        controller = main.InputController()
+        controller._process_sensor_line("0.45,0.00,1.00", "TESTE")
+        _, shift = controller.consume_lane_commands()
+        self.assertEqual(shift, 1)
+
+        controller._process_sensor_line("0.50,0.00,1.00", "TESTE")
+        _, repeated_shift = controller.consume_lane_commands()
+        self.assertEqual(repeated_shift, 0)
+
+        controller._process_sensor_line("0.00,0.00,1.00", "TESTE")
+        controller._process_sensor_line("-0.45,0.00,1.00", "TESTE")
+        _, shift = controller.consume_lane_commands()
+        self.assertEqual(shift, -1)
+
+    def test_sensor_forward_tilt_controls_crouch(self):
+        controller = main.InputController()
+        controller._process_sensor_line("0.00,0.50,0.65", "TESTE")
+        self.assertTrue(controller.is_crouching)
+        self.assertTrue(controller.sensor_crouching)
+
+        controller.sensor_crouch_until = 0.0
+        controller._process_sensor_line("0.00,0.00,1.00", "TESTE")
+        self.assertFalse(controller.is_crouching)
+
+    def test_persistent_ranking_keeps_only_top_five(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ranking.json"
+            ranking = main.RankingPersistente(path)
+            for name, score in (("Ana", 20), ("Bia", 50), ("Caio", 10), ("Duda", 90), ("Eva", 40), ("Fê", 70)):
+                ranking.registrar(name, score, "DIFICIL")
+
+            reloaded = main.RankingPersistente(path)
+            self.assertEqual([item["pontos"] for item in reloaded.entradas], [90, 70, 50, 40, 20])
+            self.assertEqual(reloaded.entradas[1]["nome"], "FÊ")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))[0]["nome"], "DUDA")
+
+    def test_corrupt_ranking_file_does_not_break_game(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ranking.json"
+            path.write_text("nao e json", encoding="utf-8")
+            self.assertEqual(main.RankingPersistente(path).entradas, [])
 
 
 if __name__ == "__main__":

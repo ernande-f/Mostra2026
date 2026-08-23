@@ -1,0 +1,14 @@
+{
+  "duration": 6,
+  "assertions": [
+    {
+      "kind": "staysInFrame",
+      "selector": "#saturn-loop"
+    },
+    {
+      "kind": "keepsMoving",
+      "withinSelector": "#ring-glints",
+      "maxStaticSec": 1.25
+    }
+  ]
+}

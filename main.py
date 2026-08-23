@@ -4,6 +4,11 @@ import math
 import sys
 import threading
 import time
+import json
+import os
+
+from datetime import datetime
+from pathlib import Path
 
 from vision_controller import VisionController
 
@@ -13,6 +18,36 @@ from vision_controller import VisionController
 LARGURA_VIRTUAL = 1280
 ALTURA_VIRTUAL = 720
 FPS = 60
+PASTA_PROJETO = Path(__file__).resolve().parent
+ARQUIVO_RANKING = PASTA_PROJETO / "dados" / "ranking.json"
+
+# Cada modo altera de verdade a velocidade dos obstaculos que se aproximam.
+# O intervalo tambem acompanha o modo para a pista continuar equilibrada.
+DIFICULDADES = {
+    "FACIL": {
+        "nome": "FÁCIL",
+        "velocidade": 0.78,
+        "spawn": 64,
+        "cor": (88, 236, 150),
+    },
+    "NORMAL": {
+        "nome": "NORMAL",
+        "velocidade": 1.00,
+        "spawn": 55,
+        "cor": (255, 218, 92),
+    },
+    "DIFICIL": {
+        "nome": "DIFÍCIL",
+        "velocidade": 1.28,
+        "spawn": 48,
+        "cor": (255, 105, 105),
+    },
+}
+ORDEM_DIFICULDADES = tuple(DIFICULDADES)
+
+# O obstaculo agora surge no alto da tela, antes do horizonte da pista.
+PROGRESSO_SPAWN = -0.24
+PROGRESSO_MINIMO_VISIVEL = -0.22
 
 # ==========================================
 # CONSTANTES DA PISTA (ANÉIS DE SATURNO - 3 FAIXAS)
@@ -52,6 +87,85 @@ TAMANHO_OBSTACULO_MAX = 74
 
 
 # =========================================================
+# RANKING LOCAL PERSISTENTE
+# =========================================================
+def normalizar_nome_jogador(nome):
+    """Limpa o nome exibido e salvo sem impedir letras acentuadas."""
+    nome_limpo = "".join(ch for ch in str(nome).strip() if ch.isalnum() or ch in "-_ ")
+    return (nome_limpo[:12].strip() or "JOGADOR").upper()
+
+
+class RankingPersistente:
+    """Mantem o top 5 em JSON, inclusive entre execucoes do jogo."""
+
+    def __init__(self, caminho=ARQUIVO_RANKING, limite=5):
+        self.caminho = Path(caminho)
+        self.limite = limite
+        self.entradas = self._carregar()
+
+    def _carregar(self):
+        try:
+            dados = json.loads(self.caminho.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+
+        if not isinstance(dados, list):
+            return []
+
+        entradas_validas = []
+        for item in dados:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pontos = max(0, int(item.get("pontos", 0)))
+            except (TypeError, ValueError):
+                continue
+            dificuldade = str(item.get("dificuldade", "NORMAL")).upper()
+            if dificuldade not in DIFICULDADES:
+                dificuldade = "NORMAL"
+            entradas_validas.append({
+                "nome": normalizar_nome_jogador(item.get("nome", "JOGADOR")),
+                "pontos": pontos,
+                "dificuldade": dificuldade,
+                "data": str(item.get("data", "")),
+            })
+
+        entradas_validas.sort(key=lambda item: item["pontos"], reverse=True)
+        return entradas_validas[:self.limite]
+
+    def registrar(self, nome, pontos, dificuldade):
+        entrada = {
+            "nome": normalizar_nome_jogador(nome),
+            "pontos": max(0, int(pontos)),
+            "dificuldade": dificuldade if dificuldade in DIFICULDADES else "NORMAL",
+            "data": datetime.now().isoformat(timespec="seconds"),
+        }
+        candidatas = self.entradas + [entrada]
+        candidatas.sort(key=lambda item: item["pontos"], reverse=True)
+        self.entradas = candidatas[:self.limite]
+        self._salvar()
+
+        # Retorna a colocacao apenas se esta partida permaneceu no top 5.
+        for indice, item in enumerate(self.entradas):
+            if item is entrada:
+                return indice + 1
+        return None
+
+    def _salvar(self):
+        try:
+            self.caminho.parent.mkdir(parents=True, exist_ok=True)
+            temporario = self.caminho.with_suffix(self.caminho.suffix + ".tmp")
+            temporario.write_text(
+                json.dumps(self.entradas, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporario, self.caminho)
+        except OSError as exc:
+            # Uma falha de escrita nao pode derrubar a partida.
+            print(f"[RANKING] Nao foi possivel salvar {self.caminho}: {exc}")
+
+
+# =========================================================
 # CONTROLADOR DE ENTRADA (CAMERA + TECLADO + ESP32)
 # =========================================================
 class InputController:
@@ -72,6 +186,16 @@ class InputController:
         self.raw_ax = 0.0
         self.raw_ay = 0.0
         self.raw_az = 1.0          # Aceleração Vertical Z (gravidade ~1.0 G em repouso)
+        self.sensor_base_ax = 0.0
+        self.sensor_base_ay = 0.0
+        self.sensor_base_az = 1.0
+        self.sensor_lateral = 0.0
+        self.sensor_frontal = 0.0
+        self.sensor_crouching = False
+        self.sensor_lane_armed = True
+        self.sensor_lane_threshold = 0.30
+        self.sensor_lane_neutral = 0.14
+        self.sensor_crouch_until = 0.0
 
         self.active_port_name = "Nenhuma"
         self.show_debug = False    # [TAB] exibe telemetria sem cobrir a pista
@@ -152,6 +276,15 @@ class InputController:
         val_vert = self.raw_az if abs(self.raw_az) > 0.6 else self.raw_ay
         self.gravity_vert = val_vert
         self.dynamic_vert = 0.0
+        self.sensor_base_ax = self.raw_ax
+        self.sensor_base_ay = self.raw_ay
+        self.sensor_base_az = self.raw_az
+        self.sensor_lateral = 0.0
+        self.sensor_frontal = 0.0
+        self.sensor_lane_armed = True
+        self.sensor_crouching = False
+        self.sensor_crouch_until = 0.0
+        self.set_crouching("esp32", False)
         if self.vision_recalibrate_callback:
             self.vision_recalibrate_callback()
         self.feedback_msg = "● RECALIBRANDO CAMERA E SENSOR..."
@@ -217,20 +350,23 @@ class InputController:
         self.esp32_thread.start()
 
     def _process_sensor_line(self, linha, source_name="ESP32"):
-        """Decodifica o pacote e executa os filtros de PULO e AGACHAMENTO."""
+        """Transforma aceleracao em pulo, agachamento e troca de faixa."""
         partes = [p.strip() for p in linha.split(',') if p.strip()]
         if len(partes) >= 1:
             try:
                 if len(partes) == 1:
                     az = float(partes[0])
                     ax, ay = 0.0, 0.0
+                    pacote_completo = False
                 elif len(partes) >= 3:
                     ax = float(partes[0])
                     ay = float(partes[1])
                     az = float(partes[2])
+                    pacote_completo = True
                 else:
                     az = float(partes[0])
                     ax, ay = 0.0, 0.0
+                    pacote_completo = False
 
                 self.raw_ax = ax
                 self.raw_ay = ay
@@ -249,6 +385,29 @@ class InputController:
                 self.peak_jump = max(self.peak_jump * 0.96, abs(self.dynamic_vert))
 
                 agora = time.time()
+
+                # O MPU6050 preso a cintura agora tambem funciona como manche:
+                # inclinar para os lados troca de faixa; inclinar para frente
+                # mantem a vaca agachada. A histerese impede repeticoes.
+                if pacote_completo:
+                    self.sensor_lateral = ax - self.sensor_base_ax
+                    self.sensor_frontal = ay - self.sensor_base_ay
+
+                    if abs(self.sensor_lateral) <= self.sensor_lane_neutral:
+                        self.sensor_lane_armed = True
+                    elif self.sensor_lane_armed and abs(self.sensor_lateral) >= self.sensor_lane_threshold:
+                        self.request_lane_shift(-1 if self.sensor_lateral < 0 else 1, "esp32")
+                        self.sensor_lane_armed = False
+
+                    inclinacao_agachar = (
+                        abs(self.sensor_frontal) >= 0.34
+                        and abs(az) <= max(0.86, abs(self.sensor_base_az) * 0.88)
+                    )
+                    impulso_agachar = self.dynamic_vert <= -0.28
+                    if inclinacao_agachar or impulso_agachar:
+                        self.sensor_crouch_until = agora + 0.32
+                    self.sensor_crouching = inclinacao_agachar or agora < self.sensor_crouch_until
+                    self.set_crouching("esp32", self.sensor_crouching)
 
                 # Detecção de PULO (Impulso Vertical Positivo do Salto)
                 # Só dispara se não estiver no ar ou aterrissando de um pulo (jump_lockout_until)
@@ -288,6 +447,8 @@ class InputController:
                 if self.active_port_name.startswith("Wi-Fi") and (time.time() - self.last_packet_time > 2.5):
                     self.esp32_connected = False
                     self.active_port_name = "Procurando Wi-Fi..."
+                    self.sensor_crouching = False
+                    self.set_crouching("esp32", False)
             except Exception:
                 time.sleep(0.05)
 
@@ -456,7 +617,7 @@ def criar_obstaculo(velocidade_base=1.0):
         'tipo': 'alto' if random.random() < 0.28 else 'chao',
         'lane_idx': lane_idx,
         'lane': LANE_RATIOS[lane_idx],
-        'progresso_y': -0.15,
+        'progresso_y': PROGRESSO_SPAWN,
         'velocidade': random.uniform(0.010, 0.016) * velocidade_base,
     }
 
@@ -540,6 +701,117 @@ def desenhar_obstaculo(canvas, obs, imagens_obstaculos):
 
     sprite = pygame.transform.smoothscale(imagem, rect.size)
     canvas.blit(sprite, rect)
+
+
+def desenhar_icone_dificuldade(canvas, dificuldade, centro, tamanho=18):
+    """Pequenos desenhos pixel-art usados no menu e no HUD."""
+    cx, cy = centro
+    cor = DIFICULDADES[dificuldade]["cor"]
+    contorno = (35, 40, 58)
+
+    if dificuldade == "FACIL":
+        pygame.draw.circle(canvas, contorno, (cx, cy), tamanho + 2)
+        pygame.draw.circle(canvas, cor, (cx, cy), tamanho)
+        pygame.draw.circle(canvas, (36, 145, 112), (cx - 6, cy - 4), max(3, tamanho // 4))
+        pygame.draw.circle(canvas, (170, 255, 205), (cx + 5, cy + 5), max(2, tamanho // 5))
+    elif dificuldade == "NORMAL":
+        pontos = []
+        for indice in range(10):
+            raio = tamanho if indice % 2 == 0 else tamanho * 0.44
+            angulo = -math.pi / 2 + indice * math.pi / 5
+            pontos.append((cx + math.cos(angulo) * raio, cy + math.sin(angulo) * raio))
+        pygame.draw.polygon(canvas, contorno, pontos)
+        internos = [
+            (cx + (x - cx) * 0.78, cy + (y - cy) * 0.78)
+            for x, y in pontos
+        ]
+        pygame.draw.polygon(canvas, cor, internos)
+    else:
+        pontos = [
+            (cx - tamanho, cy - 3), (cx - 9, cy - tamanho),
+            (cx + 8, cy - tamanho + 3), (cx + tamanho, cy + 2),
+            (cx + 7, cy + tamanho), (cx - 12, cy + tamanho - 4),
+        ]
+        pygame.draw.polygon(canvas, contorno, pontos)
+        internos = [
+            (cx + (x - cx) * 0.82, cy + (y - cy) * 0.82)
+            for x, y in pontos
+        ]
+        pygame.draw.polygon(canvas, cor, internos)
+        pygame.draw.circle(canvas, (170, 65, 75), (cx - 5, cy - 2), max(2, tamanho // 4))
+        pygame.draw.circle(canvas, (255, 155, 120), (cx + 7, cy + 6), max(2, tamanho // 5))
+
+
+def desenhar_ranking(canvas, ranking, destaque_posicao=None):
+    """Preenche o quadro de ranking que ja faz parte da arte do menu."""
+    fonte_nome = pygame.font.SysFont("Arial", 19, bold=True)
+    fonte_pontos = pygame.font.SysFont("Arial", 18, bold=True)
+    fonte_vazio = pygame.font.SysFont("Arial", 17, italic=True)
+    cores_medalha = [(255, 199, 62), (190, 205, 220), (206, 132, 80)]
+
+    painel = pygame.Rect(758, 151, 300, 458)
+    for indice in range(ranking.limite):
+        y = painel.y + indice * 82
+        preenchimento = (255, 250, 205, 205) if destaque_posicao == indice + 1 else (245, 247, 250, 178)
+        linha = pygame.Surface((painel.width, 68), pygame.SRCALPHA)
+        linha.fill(preenchimento)
+        pygame.draw.rect(linha, (95, 104, 118, 210), linha.get_rect(), 2, border_radius=7)
+        canvas.blit(linha, (painel.x, y))
+
+        medalha_cor = cores_medalha[indice] if indice < 3 else (135, 145, 160)
+        pygame.draw.circle(canvas, (70, 75, 86), (painel.x + 26, y + 34), 20)
+        pygame.draw.circle(canvas, medalha_cor, (painel.x + 26, y + 34), 16)
+        numero = fonte_pontos.render(str(indice + 1), True, (38, 42, 52))
+        canvas.blit(numero, numero.get_rect(center=(painel.x + 26, y + 34)))
+
+        if indice < len(ranking.entradas):
+            entrada = ranking.entradas[indice]
+            nome = fonte_nome.render(entrada["nome"], True, (35, 40, 52))
+            pontos = fonte_pontos.render(f'{entrada["pontos"]} PTS', True, (45, 50, 62))
+            nivel = DIFICULDADES[entrada["dificuldade"]]
+            modo = pygame.font.SysFont("Arial", 12, bold=True).render(
+                nivel["nome"], True, nivel["cor"]
+            )
+            canvas.blit(nome, (painel.x + 56, y + 10))
+            canvas.blit(pontos, (painel.right - pontos.get_width() - 12, y + 35))
+            modo_bg = pygame.Rect(painel.x + 56, y + 39, modo.get_width() + 12, 20)
+            pygame.draw.rect(canvas, (50, 55, 68), modo_bg, border_radius=9)
+            canvas.blit(modo, (modo_bg.x + 6, modo_bg.y + 3))
+        else:
+            vazio = fonte_vazio.render("ESPAÇO LIVRE", True, (118, 124, 136))
+            canvas.blit(vazio, (painel.x + 60, y + 24))
+
+
+def desenhar_seletor_dificuldade(canvas, dificuldade_atual):
+    fonte_titulo = pygame.font.SysFont("Arial", 17, bold=True)
+    fonte_opcao = pygame.font.SysFont("Arial", 15, bold=True)
+    titulo = fonte_titulo.render("DIFICULDADE  [1] [2] [3]", True, (230, 245, 255))
+    canvas.blit(titulo, (72, 396))
+
+    rects = []
+    for indice, chave in enumerate(ORDEM_DIFICULDADES):
+        rect = pygame.Rect(62 + indice * 153, 422, 143, 58)
+        rects.append(rect)
+        ativa = chave == dificuldade_atual
+        bg = (29, 42, 61) if not ativa else (48, 62, 78)
+        borda = DIFICULDADES[chave]["cor"] if ativa else (95, 112, 132)
+        pygame.draw.rect(canvas, bg, rect, border_radius=9)
+        pygame.draw.rect(canvas, borda, rect, 3 if ativa else 1, border_radius=9)
+        desenhar_icone_dificuldade(canvas, chave, (rect.x + 26, rect.centery), 14)
+        texto = fonte_opcao.render(DIFICULDADES[chave]["nome"], True, borda)
+        canvas.blit(texto, (rect.x + 48, rect.y + 19))
+    return rects
+
+
+def desenhar_indicador_sensor(canvas, posicao, ativo):
+    """Desenha uma pequena cinta/sensor com ondas de conexao."""
+    x, y = posicao
+    cor = (75, 255, 145) if ativo else (145, 155, 175)
+    pygame.draw.rect(canvas, (28, 34, 48), (x, y + 7, 28, 14), border_radius=5)
+    pygame.draw.rect(canvas, cor, (x + 8, y + 3, 12, 22), 2, border_radius=3)
+    if ativo:
+        pygame.draw.arc(canvas, cor, (x + 24, y + 3, 18, 20), -1.0, 1.0, 2)
+        pygame.draw.arc(canvas, cor, (x + 27, y, 25, 26), -1.0, 1.0, 2)
 
 
 # =========================================================
@@ -711,7 +983,7 @@ def desenhar_tabela_debug(canvas, input_ctrl, vision_ctrl, vaca=None, fps=60.0):
     if not input_ctrl.show_debug:
         return
 
-    painel_w, painel_h = 455, 330
+    painel_w, painel_h = 455, 378
     painel_x = LARGURA_VIRTUAL - painel_w - 20
     painel_y = 20
 
@@ -752,6 +1024,8 @@ def desenhar_tabela_debug(canvas, input_ctrl, vision_ctrl, vaca=None, fps=60.0):
         ("Estado da vaca:", acao_str, acao_cor),
         ("Ultima entrada:", input_ctrl.last_control_source.upper(), (200, 220, 255)),
         ("ESP32:", esp_status[:30], esp_cor),
+        ("Sensor lateral:", f"{input_ctrl.sensor_lateral:+.2f} G", (120, 235, 255)),
+        ("Sensor postura:", "AGACHADO" if input_ctrl.sensor_crouching else "EM PE", esp_cor),
         ("FPS jogo/camera:", f"{fps:.0f} / {vision_ctrl.fps:.0f}", (180, 220, 255)),
     ]
 
@@ -780,14 +1054,14 @@ def desenhar_tabela_debug(canvas, input_ctrl, vision_ctrl, vaca=None, fps=60.0):
         canvas.blit(t_pop, (pop_x + 15, pop_y + 8))
 
 
-def desenhar_preview_camera(canvas, input_ctrl, vision_ctrl, posicao=(20, 445)):
+def desenhar_preview_camera(canvas, input_ctrl, vision_ctrl, posicao=(20, 445), tamanho=None):
     """Mostra a camera dentro do jogo, sem abrir uma segunda janela."""
     if not input_ctrl.show_camera:
         return
 
     preview = vision_ctrl.get_preview()
     x, y = posicao
-    width, height = vision_ctrl.PREVIEW_SIZE
+    width, height = tamanho or vision_ctrl.PREVIEW_SIZE
     pygame.draw.rect(canvas, (10, 16, 28), (x - 5, y - 31, width + 10, height + 36), border_radius=8)
     pygame.draw.rect(canvas, (0, 210, 255), (x - 5, y - 31, width + 10, height + 36), 2, border_radius=8)
 
@@ -798,6 +1072,8 @@ def desenhar_preview_camera(canvas, input_ctrl, vision_ctrl, posicao=(20, 445)):
     if preview:
         frame_bytes, size = preview
         surface = pygame.image.frombuffer(frame_bytes, size, "RGB")
+        if surface.get_size() != (width, height):
+            surface = pygame.transform.smoothscale(surface, (width, height))
         canvas.blit(surface, (x, y))
     else:
         pygame.draw.rect(canvas, (22, 28, 42), (x, y, width, height))
@@ -808,7 +1084,14 @@ def desenhar_preview_camera(canvas, input_ctrl, vision_ctrl, posicao=(20, 445)):
 # =========================================================
 # TELA INICIAL
 # =========================================================
-def tela_inicial(display_mgr, input_ctrl, vision_ctrl):
+def tela_inicial(
+    display_mgr,
+    input_ctrl,
+    vision_ctrl,
+    ranking,
+    nome_jogador="JOGADOR",
+    dificuldade_atual="NORMAL",
+):
     fundo = carregar_asset([
         "Imagens/fundo_inicio.png",
         "Imagens/fundo_inicio1.png",
@@ -824,7 +1107,13 @@ def tela_inicial(display_mgr, input_ctrl, vision_ctrl):
 
     fonte_dica = pygame.font.SysFont("Arial", 22, bold=True)
     fonte_ctrl = pygame.font.SysFont("Arial", 20)
+    fonte_nome = pygame.font.SysFont("Arial", 20, bold=True)
+    fonte_nome_dica = pygame.font.SysFont("Arial", 13)
     clock = pygame.time.Clock()
+    nome_digitado = normalizar_nome_jogador(nome_jogador)
+    editando_nome = False
+    nome_rect = pygame.Rect(62, 493, 448, 45)
+    dificuldade_rects = [pygame.Rect(62 + i * 153, 422, 143, 58) for i in range(3)]
 
     esperando = True
     while esperando:
@@ -833,7 +1122,17 @@ def tela_inicial(display_mgr, input_ctrl, vision_ctrl):
                 pygame.quit()
                 sys.exit()
 
-            if event.type == pygame.KEYDOWN:
+            if event.type == pygame.KEYDOWN and editando_nome:
+                if event.key == pygame.K_RETURN:
+                    editando_nome = False
+                elif event.key == pygame.K_ESCAPE:
+                    editando_nome = False
+                elif event.key == pygame.K_BACKSPACE:
+                    nome_digitado = nome_digitado[:-1]
+                elif event.unicode and event.unicode.isprintable() and len(nome_digitado) < 12:
+                    candidato = normalizar_nome_jogador(nome_digitado + event.unicode)
+                    nome_digitado = "" if candidato == "JOGADOR" and not nome_digitado and event.unicode.isspace() else candidato
+            elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_f or event.key == pygame.K_F11:
                     display_mgr.toggle_fullscreen()
                 elif event.key == pygame.K_TAB:
@@ -842,6 +1141,12 @@ def tela_inicial(display_mgr, input_ctrl, vision_ctrl):
                     input_ctrl.show_camera = not input_ctrl.show_camera
                 elif event.key == pygame.K_c:
                     input_ctrl.calibrate_center()
+                elif event.key in (pygame.K_1, pygame.K_KP1):
+                    dificuldade_atual = "FACIL"
+                elif event.key in (pygame.K_2, pygame.K_KP2):
+                    dificuldade_atual = "NORMAL"
+                elif event.key in (pygame.K_3, pygame.K_KP3):
+                    dificuldade_atual = "DIFICIL"
                 elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                     esperando = False
 
@@ -849,12 +1154,42 @@ def tela_inicial(display_mgr, input_ctrl, vision_ctrl):
                 vx, vy = display_mgr.map_mouse_pos(event.pos)
                 if botao_rect.collidepoint((vx, vy)):
                     esperando = False
+                elif nome_rect.collidepoint((vx, vy)):
+                    editando_nome = True
+                    if nome_digitado == "JOGADOR":
+                        nome_digitado = ""
+                else:
+                    editando_nome = False
+                    for indice, rect in enumerate(dificuldade_rects):
+                        if rect.collidepoint((vx, vy)):
+                            dificuldade_atual = ORDEM_DIFICULDADES[indice]
+                            break
 
         # Renderiza no canvas virtual
         display_mgr.virtual_screen.blit(fundo, (0, 0))
         display_mgr.virtual_screen.blit(botao, botao_rect)
 
-        txt_dica = fonte_dica.render("Pressione [Espaço] para Iniciar | [F] Tela Cheia", True, (240, 240, 240))
+        desenhar_ranking(display_mgr.virtual_screen, ranking)
+        desenhar_seletor_dificuldade(display_mgr.virtual_screen, dificuldade_atual)
+
+        nome_bg = pygame.Surface(nome_rect.size, pygame.SRCALPHA)
+        nome_bg.fill((25, 35, 52, 225))
+        display_mgr.virtual_screen.blit(nome_bg, nome_rect)
+        pygame.draw.rect(
+            display_mgr.virtual_screen,
+            (80, 225, 255) if editando_nome else (115, 135, 158),
+            nome_rect,
+            2,
+            border_radius=8,
+        )
+        cursor = "_" if editando_nome and int(time.time() * 2) % 2 == 0 else ""
+        nome_exibido = nome_digitado or "DIGITE SEU NOME"
+        txt_nome = fonte_nome.render(f"JOGADOR: {nome_exibido}{cursor}", True, (238, 246, 255))
+        display_mgr.virtual_screen.blit(txt_nome, (nome_rect.x + 14, nome_rect.y + 8))
+        txt_nome_dica = fonte_nome_dica.render("clique para editar", True, (170, 194, 215))
+        display_mgr.virtual_screen.blit(txt_nome_dica, (nome_rect.right - txt_nome_dica.get_width() - 10, nome_rect.bottom - 17))
+
+        txt_dica = fonte_dica.render("[ESPAÇO] Iniciar  |  [1–3] Dificuldade  |  [F] Tela Cheia", True, (240, 240, 240))
         display_mgr.virtual_screen.blit(txt_dica, (LARGURA_VIRTUAL // 2 - txt_dica.get_width() // 2, ALTURA_VIRTUAL - 55))
 
         txt_inst = fonte_ctrl.render("Corpo: lados = faixas | subir = pular | baixar = agachar | [C] recalibrar", True, (255, 230, 100))
@@ -867,24 +1202,44 @@ def tela_inicial(display_mgr, input_ctrl, vision_ctrl):
             badge_txt = fonte_dica.render(f"○ {vision_ctrl.status}", True, (255, 210, 100))
         display_mgr.virtual_screen.blit(badge_txt, (30, 30))
 
-        # A area de ranking do layout funciona como monitor da camera no menu.
-        desenhar_preview_camera(display_mgr.virtual_screen, input_ctrl, vision_ctrl, posicao=(748, 175))
+        # A camera fica em miniatura para liberar o quadro original do ranking.
+        desenhar_preview_camera(
+            display_mgr.virtual_screen,
+            input_ctrl,
+            vision_ctrl,
+            posicao=(20, 105),
+            tamanho=(210, 158),
+        )
         desenhar_tabela_debug(display_mgr.virtual_screen, input_ctrl, vision_ctrl, None, clock.get_fps())
 
         display_mgr.render()
         clock.tick(FPS)
 
+    return normalizar_nome_jogador(nome_digitado), dificuldade_atual
+
 
 # =========================================================
 # LOOP PRINCIPAL DA GAMEPLAY (PULAR E ABAIXAR)
 # =========================================================
-def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_agachar, imagem_cenario, imagens_obstaculos):
+def loop_gameplay(
+    display_mgr,
+    input_ctrl,
+    vision_ctrl,
+    frames_andar,
+    frames_agachar,
+    imagem_cenario,
+    imagens_obstaculos,
+    ranking,
+    nome_jogador,
+    dificuldade,
+):
     fonte_hud = pygame.font.SysFont("Arial", 28, bold=True)
     fonte_hud_status = pygame.font.SysFont("Arial", 16, bold=True)
     fonte_go_grande = pygame.font.SysFont("Arial", 64, bold=True)
     fonte_go_sub = pygame.font.SysFont("Arial", 26)
     fonte_alerta = pygame.font.SysFont("Arial", 20, bold=True)
     clock = pygame.time.Clock()
+    config_dificuldade = DIFICULDADES[dificuldade]
 
     while True:
         vaca = VacaPlayer(frames_andar, frames_agachar)
@@ -893,11 +1248,12 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
         obstaculos = []
 
         spawn_timer = 0
-        spawn_intervalo = 55
+        spawn_intervalo = config_dificuldade["spawn"]
         pontuacao = 0.0
         distancia = 0.0
         multiplicador_dificuldade = 1.0
         game_over = False
+        posicao_ranking = None
 
         partida_ativa = True
         while partida_ativa:
@@ -925,8 +1281,9 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
 
             # 3. Lógica do Jogo
             if not game_over:
-                distancia += 0.35 * multiplicador_dificuldade
-                pontuacao += 1.0 * multiplicador_dificuldade
+                velocidade_modo = config_dificuldade["velocidade"]
+                distancia += 0.35 * velocidade_modo * multiplicador_dificuldade
+                pontuacao += velocidade_modo * multiplicador_dificuldade
 
                 multiplicador_dificuldade = min(2.2, 1.0 + (distancia / 1400.0))
                 spawn_intervalo_atual = max(26, int(spawn_intervalo / multiplicador_dificuldade))
@@ -934,7 +1291,9 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
                 # Geração de Obstáculos (Baixo / Alto)
                 spawn_timer += 1
                 if spawn_timer >= spawn_intervalo_atual:
-                    obstaculos.append(criar_obstaculo(velocidade_base=multiplicador_dificuldade))
+                    obstaculos.append(criar_obstaculo(
+                        velocidade_base=velocidade_modo * multiplicador_dificuldade
+                    ))
                     spawn_timer = 0
 
                 # Atualiza Vaca (Pulo / Agacho)
@@ -954,6 +1313,11 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
                     if BASE_Y - 45 <= cy <= BASE_Y + 35:
                         if hitbox_vaca.colliderect(calcular_hitbox_obstaculo(obs)):
                             game_over = True
+                            posicao_ranking = ranking.registrar(
+                                nome_jogador,
+                                int(pontuacao),
+                                dificuldade,
+                            )
                             break
 
             # 4. Renderização no Canvas Virtual
@@ -963,14 +1327,14 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
 
             # Do horizonte para a camera: os mais proximos cobrem os distantes.
             for obs in sorted(obstaculos, key=lambda item: item['progresso_y']):
-                if obs['progresso_y'] > -0.05:
+                if obs['progresso_y'] > PROGRESSO_MINIMO_VISIVEL:
                     desenhar_obstaculo(canvas, obs, imagens_obstaculos)
 
             # Desenha a Vaca (com sombra dinâmica e animação de pulo/agacho)
             vaca.draw(canvas)
 
             # HUD Superior
-            hud_bg = pygame.Surface((340, 105), pygame.SRCALPHA)
+            hud_bg = pygame.Surface((390, 135), pygame.SRCALPHA)
             hud_bg.fill((20, 20, 35, 190))
             canvas.blit(hud_bg, (20, 20))
 
@@ -986,6 +1350,16 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
             else:
                 txt_status = fonte_hud_status.render("○ FALLBACK: TECLADO (WASD / SETAS)", True, (255, 210, 100))
             canvas.blit(txt_status, (35, 86))
+
+            velocidade_atual = config_dificuldade["velocidade"] * multiplicador_dificuldade
+            desenhar_icone_dificuldade(canvas, dificuldade, (48, 126), 12)
+            txt_dificuldade = fonte_hud_status.render(
+                f'{config_dificuldade["nome"]}  •  VELOCIDADE x{velocidade_atual:.2f}',
+                True,
+                config_dificuldade["cor"],
+            )
+            canvas.blit(txt_dificuldade, (68, 117))
+            desenhar_indicador_sensor(canvas, (342, 108), input_ctrl.esp32_connected)
 
             # Alerta de Ação no HUD
             if vaca.is_jumping:
@@ -1009,10 +1383,24 @@ def loop_gameplay(display_mgr, input_ctrl, vision_ctrl, frames_andar, frames_aga
                 txt_sub1 = fonte_go_sub.render("Pressione [R] ou [ESPAÇO] para Jogar Novamente", True, (240, 240, 240))
                 txt_sub2 = fonte_go_sub.render("Pressione [ESC] para Voltar ao Menu Inicial", True, (180, 180, 180))
 
+                if posicao_ranking is not None:
+                    txt_ranking = fonte_go_sub.render(
+                        f"NOVO #{posicao_ranking} DO RANKING!",
+                        True,
+                        (255, 220, 80),
+                    )
+                else:
+                    txt_ranking = fonte_go_sub.render(
+                        "Continue tentando para entrar no TOP 5!",
+                        True,
+                        (190, 205, 220),
+                    )
+
                 canvas.blit(txt_go, (LARGURA_VIRTUAL // 2 - txt_go.get_width() // 2, 220))
                 canvas.blit(txt_score_final, (LARGURA_VIRTUAL // 2 - txt_score_final.get_width() // 2, 310))
-                canvas.blit(txt_sub1, (LARGURA_VIRTUAL // 2 - txt_sub1.get_width() // 2, 400))
-                canvas.blit(txt_sub2, (LARGURA_VIRTUAL // 2 - txt_sub2.get_width() // 2, 450))
+                canvas.blit(txt_ranking, (LARGURA_VIRTUAL // 2 - txt_ranking.get_width() // 2, 355))
+                canvas.blit(txt_sub1, (LARGURA_VIRTUAL // 2 - txt_sub1.get_width() // 2, 415))
+                canvas.blit(txt_sub2, (LARGURA_VIRTUAL // 2 - txt_sub2.get_width() // 2, 460))
 
             display_mgr.render()
             clock.tick(FPS)
@@ -1032,6 +1420,9 @@ def main():
     input_ctrl.vision_recalibrate_callback = vision_ctrl.request_calibration
     vision_ctrl.start()
     input_ctrl.start_esp32_connection(port="auto", baudrate=115200)
+    ranking = RankingPersistente()
+    nome_jogador = "JOGADOR"
+    dificuldade = "NORMAL"
 
     try:
         # Carrega cenário do jogo e caixa de obstáculos
@@ -1049,7 +1440,14 @@ def main():
         frames_andar, frames_agachar = carregar_sprites_vaca()
 
         while True:
-            tela_inicial(display_mgr, input_ctrl, vision_ctrl)
+            nome_jogador, dificuldade = tela_inicial(
+                display_mgr,
+                input_ctrl,
+                vision_ctrl,
+                ranking,
+                nome_jogador,
+                dificuldade,
+            )
             continuar = loop_gameplay(
                 display_mgr,
                 input_ctrl,
@@ -1058,6 +1456,9 @@ def main():
                 frames_agachar,
                 imagem_cenario,
                 imagens_obstaculos,
+                ranking,
+                nome_jogador,
+                dificuldade,
             )
             if not continuar:
                 break

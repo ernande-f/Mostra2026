@@ -1196,16 +1196,14 @@ def tela_inicial(
     dificuldade_atual="NORMAL",
 ):
     fundo = carregar_asset([
-        "Imagens/fundo_inicio.png",
-        "Imagens/fundo_inicio1.png",
+        "Imagens/fundo_inicio.gif",
         "Imagens/fundo_inicio1.jpg",
         "Imagens/fundo_jogo/caminho.png",
-        "Imagens/caminho.png"
     ])
     fundo = pygame.transform.scale(fundo, (LARGURA_VIRTUAL, ALTURA_VIRTUAL))
 
     botao = carregar_asset(["Imagens/botao_inicio.png", "Imagens/botao_inicio1.png"], com_alpha=True)
-    botao = pygame.transform.scale(botao, (250, 90))
+    botao = pygame.transform.scale(botao, (440, 67))
     botao_rect = botao.get_rect(center=(int(LARGURA_VIRTUAL // 4.4), 593))
 
     fonte_dica = pygame.font.SysFont("Arial", 22, bold=True)

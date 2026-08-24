@@ -35,6 +35,7 @@ O teclado continua disponível: `A/D` ou setas para as faixas, `W`, seta para ci
 
 ## Correções visuais
 
+- Durante a partida, `videos/gif_fundo_saturno.mp4` é reproduzido como fundo animado em loop; se o vídeo não puder ser aberto, o jogo usa automaticamente o cenário estático anterior.
 - O gameplay agora carrega o cenário completo de Saturno, em vez do fundo vazio de estrelas.
 - As três faixas recebem guias de perspectiva ciano/douradas.
 - A caixa invisível e o laser provisório foram substituídos por sprites pixel-art transparentes próprios.

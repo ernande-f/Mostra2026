@@ -20,6 +20,7 @@ ALTURA_VIRTUAL = 720
 FPS = 60
 PASTA_PROJETO = Path(__file__).resolve().parent
 ARQUIVO_RANKING = PASTA_PROJETO / "dados" / "ranking.json"
+VIDEO_FUNDO_JOGO = PASTA_PROJETO / "videos" / "gif_fundo_saturno.mp4"
 
 # Cada modo altera de verdade a velocidade dos obstaculos que se aproximam.
 # O intervalo tambem acompanha o modo para a pista continuar equilibrada.
@@ -538,6 +539,108 @@ def carregar_asset(candidatos, com_alpha=False):
     surf = pygame.Surface((1280, 720), pygame.SRCALPHA if com_alpha else 0)
     surf.fill((30, 20, 50))
     return surf
+
+
+class FundoJogoAnimado:
+    """Reproduz um MP4 em loop e usa uma imagem estática como reserva."""
+
+    def __init__(self, caminho_video, imagem_fallback, tamanho):
+        self.caminho_video = Path(caminho_video)
+        self.tamanho = tuple(tamanho)
+        self.imagem_fallback = pygame.transform.scale(imagem_fallback, self.tamanho)
+        self.frame_atual = self.imagem_fallback
+        self.video_ativo = False
+        self._capture = None
+        self._cv2 = None
+        self._intervalo_frame = 1.0 / 30.0
+        self._tempo_acumulado = 0.0
+        self._ultimo_instante = None
+        self._abrir_video()
+
+    def _abrir_video(self):
+        if not self.caminho_video.exists():
+            print(f"[FUNDO] Vídeo não encontrado: {self.caminho_video}")
+            return
+
+        try:
+            import cv2
+
+            capture = cv2.VideoCapture(str(self.caminho_video))
+            if not capture.isOpened():
+                capture.release()
+                print(f"[FUNDO] Não foi possível abrir: {self.caminho_video}")
+                return
+
+            fps_video = capture.get(cv2.CAP_PROP_FPS)
+            if fps_video and math.isfinite(fps_video) and fps_video > 0:
+                self._intervalo_frame = 1.0 / fps_video
+
+            self._cv2 = cv2
+            self._capture = capture
+            self.video_ativo = self._ler_proximo_frame()
+            if self.video_ativo:
+                print(f"[FUNDO] Vídeo animado carregado: {self.caminho_video.name}")
+            else:
+                self.close()
+        except Exception as exc:
+            print(f"[FUNDO] Erro ao carregar vídeo; usando imagem estática: {exc}")
+            self.close()
+
+    def _ler_proximo_frame(self):
+        if self._capture is None or self._cv2 is None:
+            return False
+
+        ok, frame = self._capture.read()
+        if not ok:
+            # Ao chegar ao final, volta ao primeiro quadro para manter o loop.
+            self._capture.set(self._cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self._capture.read()
+        if not ok:
+            return False
+
+        interpolacao = (
+            self._cv2.INTER_AREA
+            if frame.shape[1] >= self.tamanho[0] and frame.shape[0] >= self.tamanho[1]
+            else self._cv2.INTER_LINEAR
+        )
+        frame = self._cv2.resize(frame, self.tamanho, interpolation=interpolacao)
+        frame_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+        self.frame_atual = pygame.image.frombytes(
+            frame_rgb.tobytes(),
+            self.tamanho,
+            "RGB",
+        ).convert()
+        return True
+
+    def desenhar(self, canvas):
+        if self.video_ativo:
+            agora = time.monotonic()
+            if self._ultimo_instante is None:
+                self._ultimo_instante = agora
+            decorrido = agora - self._ultimo_instante
+            self._ultimo_instante = agora
+
+            # Uma passagem pelo menu não deve provocar uma leitura acelerada
+            # de dezenas de quadros quando a partida recomeçar.
+            if decorrido <= 0.5:
+                self._tempo_acumulado += max(0.0, decorrido)
+
+            quadros_pendentes = int(self._tempo_acumulado / self._intervalo_frame)
+            if quadros_pendentes:
+                for _ in range(min(quadros_pendentes, 12)):
+                    if not self._ler_proximo_frame():
+                        self.video_ativo = False
+                        self.frame_atual = self.imagem_fallback
+                        break
+                self._tempo_acumulado %= self._intervalo_frame
+
+        canvas.blit(self.frame_atual, (0, 0))
+
+    def close(self):
+        if self._capture is not None:
+            self._capture.release()
+        self._capture = None
+        self.video_ativo = False
 
 
 def carregar_sprites_vaca():
@@ -1227,7 +1330,7 @@ def loop_gameplay(
     vision_ctrl,
     frames_andar,
     frames_agachar,
-    imagem_cenario,
+    fundo_cenario,
     imagens_obstaculos,
     ranking,
     nome_jogador,
@@ -1322,7 +1425,7 @@ def loop_gameplay(
 
             # 4. Renderização no Canvas Virtual
             canvas = display_mgr.virtual_screen
-            canvas.blit(imagem_cenario, (0, 0))
+            fundo_cenario.desenhar(canvas)
             desenhar_guias_faixas(canvas)
 
             # Do horizonte para a camera: os mais proximos cobrem os distantes.
@@ -1423,6 +1526,7 @@ def main():
     ranking = RankingPersistente()
     nome_jogador = "JOGADOR"
     dificuldade = "NORMAL"
+    fundo_cenario = None
 
     try:
         # Carrega cenário do jogo e caixa de obstáculos
@@ -1433,7 +1537,11 @@ def main():
             "Imagens/caminho1.png",
             "Imagens/fundo_jogo/listra.png"
         ])
-        imagem_cenario = pygame.transform.scale(imagem_cenario, (LARGURA_VIRTUAL, ALTURA_VIRTUAL))
+        fundo_cenario = FundoJogoAnimado(
+            VIDEO_FUNDO_JOGO,
+            imagem_cenario,
+            (LARGURA_VIRTUAL, ALTURA_VIRTUAL),
+        )
 
         imagens_obstaculos = carregar_assets_obstaculos()
 
@@ -1454,7 +1562,7 @@ def main():
                 vision_ctrl,
                 frames_andar,
                 frames_agachar,
-                imagem_cenario,
+                fundo_cenario,
                 imagens_obstaculos,
                 ranking,
                 nome_jogador,
@@ -1463,6 +1571,8 @@ def main():
             if not continuar:
                 break
     finally:
+        if fundo_cenario is not None:
+            fundo_cenario.close()
         vision_ctrl.stop()
         input_ctrl.esp32_running = False
         pygame.quit()

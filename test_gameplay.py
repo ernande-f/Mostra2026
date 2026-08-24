@@ -98,6 +98,22 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
         self.assertLess(y, main.HORIZON_Y)
         self.assertLessEqual(main.PROGRESSO_MINIMO_VISIVEL, -0.20)
 
+    def test_saturn_video_is_available_as_animated_game_background(self):
+        fallback = pygame.Surface((main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL))
+        background = main.FundoJogoAnimado(
+            main.VIDEO_FUNDO_JOGO,
+            fallback,
+            (main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL),
+        )
+        try:
+            self.assertTrue(background.video_ativo)
+            self.assertEqual(
+                background.frame_atual.get_size(),
+                (main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL),
+            )
+        finally:
+            background.close()
+
     def test_difficulty_changes_approach_speed(self):
         with patch("main.random.uniform", return_value=0.012):
             easy = main.criar_obstaculo(main.DIFICULDADES["FACIL"]["velocidade"])

@@ -21,10 +21,7 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
         pygame.display.set_mode((320, 180))
         cls.walk_frames, cls.crouch_frames = main.carregar_sprites_vaca()
         cls.assets = main.carregar_assets_obstaculos()
-        cls.base_progress = (
-            (main.BASE_Y - main.HORIZON_Y)
-            / (main.BASE_Y - main.HORIZON_Y + 120)
-        )
+        cls.base_progress = main.PROGRESSO_PLANO_VACA
 
     @classmethod
     def tearDownClass(cls):
@@ -84,19 +81,34 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
         cow.is_crouching = True
         self.assertFalse(cow.get_hitbox().colliderect(gate_hitbox))
 
+    def test_full_obstacle_requires_changing_lane(self):
+        obstacle_hitbox = main.calcular_hitbox_obstaculo(self.obstacle("bloqueio"))
+
+        standing_cow = self.cow()
+        self.assertTrue(standing_cow.get_hitbox().colliderect(obstacle_hitbox))
+
+        crouched_cow = self.cow()
+        crouched_cow.is_crouching = True
+        self.assertTrue(crouched_cow.get_hitbox().colliderect(obstacle_hitbox))
+
+        jumping_cow = self.cow()
+        jumping_cow.is_jumping = True
+        jumping_cow.jump_y = -180.0
+        self.assertTrue(jumping_cow.get_hitbox().colliderect(obstacle_hitbox))
+
     def test_other_lane_does_not_collide(self):
         cow = self.cow(lane=0)
-        for kind in ("chao", "alto"):
+        for kind in ("chao", "alto", "bloqueio"):
             self.assertFalse(cow.get_hitbox().colliderect(
                 main.calcular_hitbox_obstaculo(self.obstacle(kind, lane=2))
             ))
 
-    def test_obstacle_is_born_above_the_track_horizon(self):
+    def test_obstacle_is_born_at_the_beginning_of_the_rings(self):
         obstacle = main.criar_obstaculo()
         self.assertEqual(obstacle["progresso_y"], main.PROGRESSO_SPAWN)
         _, y, _ = main.calcular_posicao_pista(obstacle["progresso_y"], obstacle["lane"])
         self.assertLess(y, main.HORIZON_Y)
-        self.assertLessEqual(main.PROGRESSO_MINIMO_VISIVEL, -0.20)
+        self.assertEqual(main.PROGRESSO_MINIMO_VISIVEL, main.PROGRESSO_SPAWN)
 
     def test_saturn_video_is_available_as_animated_game_background(self):
         fallback = pygame.Surface((main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL))
@@ -114,43 +126,109 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
         finally:
             background.close()
 
-    def test_difficulty_changes_approach_speed(self):
+    def test_initial_background_uses_every_native_gif_frame(self):
+        background = main.FundoGifAnimado(
+            main.PASTA_PROJETO / "Imagens" / "fundo_inicio.gif",
+            (main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL),
+        )
+        self.assertEqual(background.frame_count, 5)
+        self.assertEqual(
+            {frame.get_size() for frame in background.frames},
+            {(main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL)},
+        )
+
+    def test_name_input_keeps_partial_text_and_accepts_accents(self):
+        self.assertEqual(main.limpar_nome_digitado(""), "")
+        self.assertEqual(main.limpar_nome_digitado("Fê da-Silva!"), "FÊ DA-SILVA")
+        self.assertEqual(main.normalizar_nome_jogador("  "), "JOGADOR")
+
+    def test_play_opens_name_editor_and_enter_confirms_the_name(self):
+        class FakeDisplay:
+            def __init__(self):
+                self.virtual_screen = pygame.Surface(
+                    (main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL)
+                )
+
+            @staticmethod
+            def map_mouse_pos(pos):
+                return pos
+
+            @staticmethod
+            def toggle_fullscreen():
+                return None
+
+            @staticmethod
+            def render():
+                return None
+
+        class FakeVision:
+            pass
+
+        pygame.event.clear()
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
+        pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text="Fê"))
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
+
+        nome = main.tela_inicial(
+            FakeDisplay(),
+            main.InputController(),
+            FakeVision(),
+            main.RankingPersistente(Path("/arquivo/que/nao/existe.json")),
+        )
+        self.assertEqual(nome, "FÊ")
+
+    def test_only_easy_mode_is_available(self):
+        self.assertEqual(tuple(main.DIFICULDADES), (main.MODO_JOGO,))
         with patch("main.random.uniform", return_value=0.012):
             easy = main.criar_obstaculo(main.DIFICULDADES["FACIL"]["velocidade"])
-            hard = main.criar_obstaculo(main.DIFICULDADES["DIFICIL"]["velocidade"])
-        self.assertGreater(hard["velocidade"], easy["velocidade"] * 1.5)
+        self.assertAlmostEqual(easy["velocidade"], 0.012 * 0.78)
 
-    def test_sensor_tilt_changes_lane_once_until_returning_to_center(self):
+    def test_lane_routes_follow_the_three_bands_in_the_background(self):
+        samples = (
+            (240, (637, 715, 803)),
+            (380, (749, 848, 958)),
+            (580, (765, 924, 1067)),
+            (700, (725, 924, 1082)),
+        )
+        alcance_vertical = main.BASE_Y - main.HORIZON_Y + 120
+        for y, expected_xs in samples:
+            progress = (y - main.HORIZON_Y) / alcance_vertical
+            actual_xs = [
+                main.calcular_posicao_pista(progress, lane)[0]
+                for lane in main.LANE_RATIOS
+            ]
+            for actual, expected in zip(actual_xs, expected_xs):
+                self.assertAlmostEqual(actual, expected, delta=2.0)
+
+    def test_cow_uses_the_same_lane_centers_as_obstacles(self):
+        for lane_index, lane_ratio in enumerate(main.LANE_RATIOS):
+            cow = self.cow(lane=lane_index)
+            cow_center = cow.x + main.LARGURA_VACA_NORMAL / 2
+            route_center = main.calcular_posicao_pista(
+                main.PROGRESSO_PLANO_VACA,
+                lane_ratio,
+            )[0]
+            self.assertAlmostEqual(cow_center, route_center)
+
+    def test_obstacle_scale_stops_growing_near_the_end_of_lane(self):
+        size_at_cap = main.calcular_posicao_pista(0.92)[2]
+        self.assertEqual(main.calcular_posicao_pista(1.00)[2], size_at_cap)
+        self.assertEqual(main.calcular_posicao_pista(1.20)[2], size_at_cap)
+
+    def test_runtime_input_has_no_esp32_or_accelerometer_hooks(self):
         controller = main.InputController()
-        controller._process_sensor_line("0.45,0.00,1.00", "TESTE")
-        _, shift = controller.consume_lane_commands()
-        self.assertEqual(shift, 1)
-
-        controller._process_sensor_line("0.50,0.00,1.00", "TESTE")
-        _, repeated_shift = controller.consume_lane_commands()
-        self.assertEqual(repeated_shift, 0)
-
-        controller._process_sensor_line("0.00,0.00,1.00", "TESTE")
-        controller._process_sensor_line("-0.45,0.00,1.00", "TESTE")
-        _, shift = controller.consume_lane_commands()
-        self.assertEqual(shift, -1)
-
-    def test_sensor_forward_tilt_controls_crouch(self):
-        controller = main.InputController()
-        controller._process_sensor_line("0.00,0.50,0.65", "TESTE")
-        self.assertTrue(controller.is_crouching)
-        self.assertTrue(controller.sensor_crouching)
-
-        controller.sensor_crouch_until = 0.0
-        controller._process_sensor_line("0.00,0.00,1.00", "TESTE")
-        self.assertFalse(controller.is_crouching)
+        self.assertFalse(hasattr(controller, "start_esp32_connection"))
+        self.assertFalse(hasattr(controller, "esp32_connected"))
+        self.assertFalse(hasattr(controller, "impact_interpreter"))
+        self.assertFalse(hasattr(controller, "consume_impacts"))
+        self.assertFalse(controller.show_camera)
 
     def test_persistent_ranking_keeps_only_top_five(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "ranking.json"
             ranking = main.RankingPersistente(path)
             for name, score in (("Ana", 20), ("Bia", 50), ("Caio", 10), ("Duda", 90), ("Eva", 40), ("Fê", 70)):
-                ranking.registrar(name, score, "DIFICIL")
+                ranking.registrar(name, score, main.MODO_JOGO)
 
             reloaded = main.RankingPersistente(path)
             self.assertEqual([item["pontos"] for item in reloaded.entradas], [90, 70, 50, 40, 20])

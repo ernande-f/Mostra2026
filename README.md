@@ -1,46 +1,44 @@
 # Cow Abduct com visão computacional
 
-O jogo usa **OpenCV + MediaPipe Pose** para transformar o movimento do corpo em comandos da vaquinha. A câmera é processada em uma thread separada, portanto não reduz o FPS do loop principal. Se o MediaPipe não puder iniciar no Mac, há um fallback por detecção facial do OpenCV.
+O jogo usa **OpenCV + MediaPipe Pose** para transformar o movimento do corpo em comandos da vaquinha. A câmera é processada em uma thread separada e o teclado permanece disponível como fallback.
+
+O ESP32 está temporariamente fora do jogo: o programa não abre conexão Wi-Fi, não procura porta USB, não lê acelerômetro e não mostra poderes ou painéis de sensor.
 
 ## Como abrir no macOS
 
 1. Na primeira vez, dê dois cliques em `instalar_dependencias.command`.
 2. Depois, dê dois cliques em `jogar.command`.
 3. Quando o macOS perguntar, permita o acesso do Python/Terminal à câmera.
-4. Fique no centro e em pé durante a calibração inicial (cerca de 1–2 segundos).
+4. Fique no centro e em pé durante a calibração inicial, por cerca de 1–2 segundos.
 
-Se a câmera já tiver sido negada, abra **Ajustes do Sistema → Privacidade e Segurança → Câmera** e habilite o Terminal ou o Codex (o aplicativo a partir do qual o jogo for executado).
+Se a câmera já tiver sido negada, abra **Ajustes do Sistema → Privacidade e Segurança → Câmera** e habilite o Terminal ou o aplicativo usado para executar o jogo.
 
-O projeto usa Python 3.12 porque essa é a versão compatível com o MediaPipe usado pelo jogo. O Python 3.14 global não deve ser usado para executá-lo.
+O projeto usa Python 3.12 porque essa é a versão compatível com o MediaPipe. O Python 3.14 global não deve ser usado para executá-lo.
 
 ## Controles corporais
 
-- Mover o tronco para a esquerda/direita: troca entre as três faixas.
+- Mover o tronco para a esquerda ou direita: troca entre as três faixas.
 - Subir o corpo: pula.
-- Baixar/agachar o corpo: agacha a vaquinha.
-- Cinta ESP32/MPU6050: incline para os lados para trocar de faixa, dê o impulso vertical para pular e incline para frente para agachar.
-- `C`: recalibra a posição neutra da câmera e o ESP32.
-- `V`: mostra/oculta a câmera dentro do jogo.
-- `Tab`: mostra/oculta a telemetria.
+- Baixar ou agachar o corpo: agacha a vaquinha.
+- `C`: recalibra a posição neutra da câmera.
+- `V`: mostra ou oculta a câmera dentro do jogo.
+- `Tab`: mostra ou oculta a telemetria.
+- `F` ou `F11`: alterna a tela cheia.
 
-O teclado continua disponível: `A/D` ou setas para as faixas, `W`, seta para cima ou espaço para pular, `S`, seta para baixo ou Shift para agachar. O controle ESP32 existente também foi preservado.
+O teclado continua disponível: `A/D` ou setas para trocar de faixa, `W`, seta para cima ou espaço para pular, e `S`, seta para baixo ou Shift para agachar.
 
-## Ranking e dificuldade
+## Obstáculos e ranking
 
-- Clique em **JOGADOR** no menu para escrever um nome de até 12 caracteres.
-- Escolha **Fácil**, **Normal** ou **Difícil** clicando nos cartões ou usando `1`, `2` e `3`.
-- Cada dificuldade altera a velocidade de aproximação e o intervalo dos obstáculos. A velocidade atual aparece no HUD durante a partida.
+- O menu inicial usa `Imagens/fundo_inicio.gif` animado em sua resolução nativa de 1280×720 e mostra apenas **JOGAR** e o ranking.
+- Clique em **JOGAR** ou pressione espaço para abrir a entrada de nome.
+- Digite um nome de até 12 caracteres e pressione `Enter` para iniciar; `Esc` cancela e volta ao menu.
+- A câmera fica oculta por padrão. Pressione `V` quando quiser mostrar ou ocultar sua prévia.
 - As cinco melhores pontuações ficam salvas em `dados/ranking.json` e reaparecem quando o jogo é aberto novamente.
-- Os obstáculos agora entram pela parte superior da pista, antes do horizonte, dando mais tempo para enxergá-los.
-
-## Correções visuais
-
-- Durante a partida, `videos/gif_fundo_saturno.mp4` é reproduzido como fundo animado em loop; se o vídeo não puder ser aberto, o jogo usa automaticamente o cenário estático anterior.
-- O gameplay agora carrega o cenário completo de Saturno, em vez do fundo vazio de estrelas.
-- As três faixas recebem guias de perspectiva ciano/douradas.
-- A caixa invisível e o laser provisório foram substituídos por sprites pixel-art transparentes próprios.
-- Sprite, hitbox e feixe foram alinhados para o agachamento ficar visualmente justo.
-- O menu recebeu medalhas, planetas, estrela e asteroide desenhados em tempo real para identificar ranking e dificuldades.
+- A dificuldade não é exibida na interface; o ritmo atual da partida foi mantido sem alterações.
+- `ob1` bloqueia a faixa e exige desvio lateral.
+- `ob2` é baixo e exige pulo.
+- `ob3` deixa uma passagem inferior e exige agachamento.
+- Uma colisão encerra a partida e registra a pontuação no ranking.
 
 ## Execução pelo terminal
 
@@ -49,7 +47,7 @@ O teclado continua disponível: `A/D` ou setas para as faixas, `W`, seta para ci
 ./jogar.command
 ```
 
-Para rodar apenas os testes dos gestos:
+Para executar a suíte de testes:
 
 ```bash
 .venv/bin/python -m unittest -v test_vision_controller.py test_gameplay.py

@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from esp32_power import Esp32PowerController
 from vision_controller import VisionController
 
 # ==========================================
@@ -41,7 +42,7 @@ PROGRESSO_MINIMO_VISIVEL = -0.04
 # ==========================================
 # Os anéis de Saturno ficam na metade direita da imagem
 HORIZON_Y = 220
-BASE_Y = 580
+BASE_Y = 620
 PROGRESSO_PLANO_VACA = (
     (BASE_Y - HORIZON_Y)
     / (BASE_Y - HORIZON_Y + 120)
@@ -687,6 +688,12 @@ def desenhar_obstaculo(canvas, obs, imagens_obstaculos):
     canvas.blit(sprite, rect)
 
 
+def obstaculo_em_primeiro_plano(obs):
+    """Indica quando o obstaculo ja esta na frente do plano da vaca."""
+    _, cy, _ = calcular_posicao_pista(obs['progresso_y'], obs['lane'])
+    return cy >= BASE_Y - 10
+
+
 def desenhar_ranking(canvas, ranking, destaque_posicao=None):
     """Preenche o quadro de ranking que ja faz parte da arte do menu."""
     fonte_nome = pygame.font.SysFont("Arial", 19, bold=True)
@@ -889,12 +896,21 @@ class DisplayManager:
 # =========================================================
 # TABELA / PAINEL DE DEBUG EM TEMPO REAL
 # =========================================================
-def desenhar_tabela_debug(canvas, input_ctrl, vision_ctrl, vaca=None, fps=60.0):
+def desenhar_tabela_debug(
+    canvas,
+    input_ctrl,
+    vision_ctrl,
+    vaca=None,
+    fps=60.0,
+    power_ctrl=None,
+):
     """Renderiza a leitura da camera e o estado do player em tempo real."""
     if not input_ctrl.show_debug:
         return
 
-    painel_w, painel_h = 455, 330
+    power_snapshot = power_ctrl.snapshot() if power_ctrl is not None else None
+    painel_w = 455
+    painel_h = 402 if power_snapshot is not None else 330
     painel_x = LARGURA_VIRTUAL - painel_w - 20
     painel_y = 20
 
@@ -932,6 +948,30 @@ def desenhar_tabela_debug(canvas, input_ctrl, vision_ctrl, vaca=None, fps=60.0):
         ("Ultima entrada:", input_ctrl.last_control_source.upper(), (200, 220, 255)),
         ("FPS jogo/camera:", f"{fps:.0f} / {vision_ctrl.fps:.0f}", (180, 220, 255)),
     ]
+    if power_snapshot is not None:
+        if power_snapshot.shield_active:
+            power_state = "ESCUDO ATIVO"
+        elif power_snapshot.twist_ready:
+            power_state = "GIRE PARA ATIVAR"
+        elif power_snapshot.armed:
+            power_state = "PARE A CAIXA"
+        else:
+            power_state = f"CARGA {power_snapshot.charge_ratio * 100:.0f}%"
+        esp32_color = (
+            (80, 255, 135)
+            if power_snapshot.connected
+            else (255, 190, 80)
+        )
+        linhas.extend([
+            ("ESP32 Wi-Fi:", power_snapshot.status[:34], esp32_color),
+            ("Nucleo:", power_state, (80, 245, 210)),
+            (
+                "Mov./giro:",
+                f"{power_snapshot.motion_intensity:.2f} g / "
+                f"{power_snapshot.gyro_speed:.0f} dps",
+                (130, 210, 255),
+            ),
+        ])
 
     curr_y = painel_y + 38
     for label, val, cor in linhas:
@@ -985,6 +1025,118 @@ def desenhar_preview_camera(canvas, input_ctrl, vision_ctrl, posicao=(20, 445), 
         canvas.blit(mensagem, (x + 12, y + height // 2 - 8))
 
 
+def desenhar_poder_esp32(canvas, vaca, snapshot, agora=None):
+    """Desenha carga, escudo e impacto ao redor da vaca, sem criar outro HUD."""
+    agora = time.monotonic() if agora is None else agora
+    if (
+        not snapshot.connected
+        and not snapshot.shield_active
+        and snapshot.activation_flash <= 0.0
+        and snapshot.hit_flash <= 0.0
+    ):
+        return
+    if (
+        snapshot.charge_ratio <= 0.0
+        and not snapshot.shield_active
+        and snapshot.activation_flash <= 0.0
+        and snapshot.hit_flash <= 0.0
+    ):
+        return
+
+    hitbox = vaca.get_hitbox()
+    center_x, center_y = hitbox.center
+    tamanho = 250
+    centro = tamanho // 2
+    overlay = pygame.Surface((tamanho, tamanho), pygame.SRCALPHA)
+    pulso = (math.sin(agora * 7.0) + 1.0) * 0.5
+
+    if snapshot.charge_ratio > 0.0 and not snapshot.shield_active:
+        raio = 72 + int(pulso * 4)
+        rect = pygame.Rect(
+            centro - raio,
+            centro - raio,
+            raio * 2,
+            raio * 2,
+        )
+        cor = (80, 255, 165, 235 if snapshot.armed else 185)
+        inicio = -math.pi / 2
+        fim = inicio + math.tau * snapshot.charge_ratio
+        pygame.draw.arc(overlay, cor, rect, inicio, fim, 5)
+
+        angulo = fim
+        ponto = (
+            int(centro + math.cos(angulo) * raio),
+            int(centro + math.sin(angulo) * raio),
+        )
+        pygame.draw.circle(overlay, (205, 255, 235, 245), ponto, 5)
+
+        if snapshot.armed:
+            alpha = 80 + int(pulso * 80)
+            pygame.draw.circle(
+                overlay,
+                (75, 255, 190, alpha),
+                (centro, centro),
+                raio + 8,
+                3,
+            )
+
+    if snapshot.shield_active:
+        raio = 86 + int(pulso * 5)
+        pygame.draw.circle(
+            overlay,
+            (40, 245, 190, 38),
+            (centro, centro),
+            raio,
+        )
+        pygame.draw.circle(
+            overlay,
+            (105, 255, 215, 230),
+            (centro, centro),
+            raio,
+            5,
+        )
+        pygame.draw.circle(
+            overlay,
+            (205, 255, 245, 115),
+            (centro, centro),
+            raio - 9,
+            2,
+        )
+        for indice in range(6):
+            angulo = agora * 1.8 + indice * math.tau / 6
+            px = int(centro + math.cos(angulo) * (raio + 7))
+            py = int(centro + math.sin(angulo) * (raio + 7))
+            pygame.draw.circle(overlay, (180, 255, 235, 220), (px, py), 3)
+
+    if snapshot.activation_flash > 0.0:
+        progresso = 1.0 - snapshot.activation_flash
+        raio = int(78 + progresso * 62)
+        alpha = int(210 * snapshot.activation_flash)
+        pygame.draw.circle(
+            overlay,
+            (110, 255, 220, alpha),
+            (centro, centro),
+            raio,
+            6,
+        )
+
+    if snapshot.hit_flash > 0.0:
+        raio = int(72 + (1.0 - snapshot.hit_flash) * 75)
+        alpha = int(255 * snapshot.hit_flash)
+        pygame.draw.circle(
+            overlay,
+            (240, 255, 255, alpha),
+            (centro, centro),
+            raio,
+            9,
+        )
+
+    canvas.blit(
+        overlay,
+        (center_x - centro, center_y - centro),
+    )
+
+
 # =========================================================
 # TELA INICIAL
 # =========================================================
@@ -1032,6 +1184,7 @@ def tela_inicial(
     vision_ctrl,
     ranking,
     nome_jogador="JOGADOR",
+    power_ctrl=None,
 ):
     fundo = FundoGifAnimado(
         PASTA_PROJETO / "Imagens" / "fundo_inicio.gif",
@@ -1122,6 +1275,7 @@ def tela_inicial(
                 vision_ctrl,
                 None,
                 clock.get_fps(),
+                power_ctrl,
             )
 
             if editando_nome:
@@ -1148,6 +1302,7 @@ def loop_gameplay(
     imagens_obstaculos,
     ranking,
     nome_jogador,
+    power_ctrl=None,
 ):
     fonte_hud = pygame.font.SysFont("Arial", 28, bold=True)
     fonte_go_grande = pygame.font.SysFont("Arial", 64, bold=True)
@@ -1156,6 +1311,8 @@ def loop_gameplay(
     config_dificuldade = DIFICULDADES[MODO_JOGO]
 
     while True:
+        if power_ctrl is not None:
+            power_ctrl.set_enabled(True, reset=True)
         vaca = VacaPlayer(frames_andar, frames_agachar)
         input_ctrl.consume_jump()
         input_ctrl.consume_lane_commands()
@@ -1207,23 +1364,59 @@ def loop_gameplay(
                     _, cy, _ = calcular_posicao_pista(obs['progresso_y'], obs['lane'])
                     if BASE_Y - 45 <= cy <= BASE_Y + 35:
                         if hitbox_vaca.colliderect(calcular_hitbox_obstaculo(obs)):
-                            game_over = True
-                            posicao_ranking = ranking.registrar(
-                                nome_jogador,
-                                int(pontuacao),
-                                MODO_JOGO,
+                            escudo_absorveu = (
+                                power_ctrl is not None
+                                and power_ctrl.absorb_collision()
                             )
+                            if escudo_absorveu:
+                                obs["removido_pelo_escudo"] = True
+                            else:
+                                game_over = True
+                                posicao_ranking = ranking.registrar(
+                                    nome_jogador,
+                                    int(pontuacao),
+                                    MODO_JOGO,
+                                )
                             break
+                obstaculos = [
+                    obs for obs in obstaculos
+                    if not obs.get("removido_pelo_escudo")
+                ]
 
             canvas = display_mgr.virtual_screen
             fundo_cenario.desenhar(canvas)
             desenhar_guias_faixas(canvas)
 
-            for obs in sorted(obstaculos, key=lambda item: item['progresso_y']):
-                if obs['progresso_y'] > PROGRESSO_MINIMO_VISIVEL:
-                    desenhar_obstaculo(canvas, obs, imagens_obstaculos)
+            obstaculos_visiveis = [
+                obs for obs in sorted(
+                    obstaculos,
+                    key=lambda item: item['progresso_y'],
+                )
+                if obs['progresso_y'] > PROGRESSO_MINIMO_VISIVEL
+            ]
+            obstaculos_atras = [
+                obs for obs in obstaculos_visiveis
+                if not obstaculo_em_primeiro_plano(obs)
+            ]
+            obstaculos_na_frente = [
+                obs for obs in obstaculos_visiveis
+                if obstaculo_em_primeiro_plano(obs)
+            ]
+
+            for obs in obstaculos_atras:
+                desenhar_obstaculo(canvas, obs, imagens_obstaculos)
 
             vaca.draw(canvas)
+
+            if power_ctrl is not None:
+                power_snapshot = power_ctrl.snapshot()
+                desenhar_poder_esp32(canvas, vaca, power_snapshot)
+
+            # Portais e demais obstaculos que cruzaram o plano da vaca ficam
+            # por cima dela. A transparencia do ob3 revela a vaca agachada na
+            # passagem inferior e sua copa encobre a vaca que nao agachou.
+            for obs in obstaculos_na_frente:
+                desenhar_obstaculo(canvas, obs, imagens_obstaculos)
 
             hud_bg = pygame.Surface((335, 78), pygame.SRCALPHA)
             hud_bg.fill((20, 20, 35, 190))
@@ -1241,6 +1434,7 @@ def loop_gameplay(
                 vision_ctrl,
                 vaca,
                 clock.get_fps(),
+                power_ctrl,
             )
 
             if game_over:
@@ -1301,6 +1495,8 @@ def main():
     vision_ctrl = VisionController(input_ctrl)
     input_ctrl.vision_recalibrate_callback = vision_ctrl.request_calibration
     vision_ctrl.start()
+    power_ctrl = Esp32PowerController()
+    power_ctrl.start()
     ranking = RankingPersistente()
     nome_jogador = "JOGADOR"
     fundo_cenario = None
@@ -1324,12 +1520,14 @@ def main():
         frames_andar, frames_agachar = carregar_sprites_vaca()
 
         while True:
+            power_ctrl.set_enabled(False)
             nome_jogador = tela_inicial(
                 display_mgr,
                 input_ctrl,
                 vision_ctrl,
                 ranking,
                 nome_jogador,
+                power_ctrl,
             )
             continuar = loop_gameplay(
                 display_mgr,
@@ -1341,12 +1539,14 @@ def main():
                 imagens_obstaculos,
                 ranking,
                 nome_jogador,
+                power_ctrl,
             )
             if not continuar:
                 break
     finally:
         if fundo_cenario is not None:
             fundo_cenario.close()
+        power_ctrl.stop()
         vision_ctrl.stop()
         pygame.quit()
 

@@ -12,6 +12,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 import main
+from esp32_power import PowerSnapshot
 
 
 class GameplayVisualAndCollisionTests(unittest.TestCase):
@@ -54,6 +55,31 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
             self.crouch_frames[0].get_height(),
             self.walk_frames[0].get_height() * 0.70,
         )
+
+    def test_active_esp32_shield_draws_a_large_effect_around_the_cow(self):
+        canvas = pygame.Surface(
+            (main.LARGURA_VIRTUAL, main.ALTURA_VIRTUAL),
+            pygame.SRCALPHA,
+        )
+        snapshot = PowerSnapshot(
+            connected=True,
+            status="CONECTADO",
+            source_ip="192.168.4.1",
+            packets_received=10,
+            charge_ratio=0.0,
+            armed=False,
+            twist_ready=False,
+            shield_active=True,
+            motion_intensity=0.0,
+            gyro_speed=0.0,
+            activation_flash=1.0,
+            hit_flash=0.0,
+        )
+        cow = self.cow()
+        main.desenhar_poder_esp32(canvas, cow, snapshot, agora=1.0)
+        effect_rect = canvas.get_bounding_rect(min_alpha=10)
+        self.assertGreater(effect_rect.width, 150)
+        self.assertGreater(effect_rect.height, 150)
 
     def test_ground_crate_hits_standing_or_crouched_cow_in_same_lane(self):
         cow = self.cow()
@@ -214,6 +240,14 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
         size_at_cap = main.calcular_posicao_pista(0.92)[2]
         self.assertEqual(main.calcular_posicao_pista(1.00)[2], size_at_cap)
         self.assertEqual(main.calcular_posicao_pista(1.20)[2], size_at_cap)
+
+    def test_obstacle_moves_in_front_of_cow_at_the_crossing_plane(self):
+        for kind in ("chao", "alto", "bloqueio"):
+            obstacle = self.obstacle(kind)
+            self.assertTrue(main.obstaculo_em_primeiro_plano(obstacle))
+
+            obstacle["progresso_y"] = main.PROGRESSO_SPAWN
+            self.assertFalse(main.obstaculo_em_primeiro_plano(obstacle))
 
     def test_runtime_input_has_no_esp32_or_accelerometer_hooks(self):
         controller = main.InputController()

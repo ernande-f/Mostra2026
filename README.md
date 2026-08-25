@@ -2,7 +2,7 @@
 
 O jogo usa **OpenCV + MediaPipe Pose** para transformar o movimento do corpo em comandos da vaquinha. A câmera é processada em uma thread separada e o teclado permanece disponível como fallback.
 
-O ESP32 está temporariamente fora do jogo: o programa não abre conexão Wi-Fi, não procura porta USB, não lê acelerômetro e não mostra poderes ou painéis de sensor.
+O **ESP32 + MPU6050** funciona como Núcleo de Abdução sem substituir a visão computacional: chacoalhar a caixa carrega energia e um giro rápido ativa um escudo contra uma colisão. A comunicação é feita por Wi-Fi/UDP e não exige LEDs, botões ou outros componentes.
 
 ## Como abrir no macOS
 
@@ -27,6 +27,28 @@ O projeto usa Python 3.12 porque essa é a versão compatível com o MediaPipe. 
 
 O teclado continua disponível: `A/D` ou setas para trocar de faixa, `W`, seta para cima ou espaço para pular, e `S`, seta para baixo ou Shift para agachar.
 
+## Núcleo de Abdução ESP32 + MPU6050
+
+O firmware fica em `esp32_sensor/esp32_sensor.ino` e usa somente as bibliotecas `Wire`, `WiFi` e `WiFiUdp` que acompanham o pacote ESP32 da Arduino IDE.
+
+Ligação usada pelo firmware:
+
+- `MPU6050 VCC` → `ESP32 3V3`
+- `MPU6050 GND` → `ESP32 GND`
+- `MPU6050 SDA` → `ESP32 GPIO 21`
+- `MPU6050 SCL` → `ESP32 GPIO 22`
+
+Para usar:
+
+1. Grave `esp32_sensor.ino` no ESP32 pela Arduino IDE.
+2. No Mac, conecte-se à rede **ESP32_COW_GAME** com a senha **12345678**. O aviso “sem internet” é esperado.
+3. Abra o jogo normalmente. Ele passa a escutar automaticamente a porta UDP `4210`.
+4. Durante a partida, chacoalhe a caixa até o círculo de energia ao redor da vaca completar.
+5. Pare a caixa por um instante e faça um giro rápido com o pulso.
+6. O escudo permanece por até 12 segundos ou desaparece ao impedir uma colisão.
+
+O menu continua limpo. Pressione `Tab` somente quando quiser conferir conexão, carga, intensidade do movimento e velocidade de giro. Para diagnosticar os pacotes sem abrir o jogo, execute `.venv/bin/python test_esp32.py`; feche o monitor antes de iniciar o jogo porque ambos usam a mesma porta UDP.
+
 ## Obstáculos e ranking
 
 - O menu inicial usa `Imagens/fundo_inicio.gif` animado em sua resolução nativa de 1280×720 e mostra apenas **JOGAR** e o ranking.
@@ -50,5 +72,5 @@ O teclado continua disponível: `A/D` ou setas para trocar de faixa, `W`, seta p
 Para executar a suíte de testes:
 
 ```bash
-.venv/bin/python -m unittest -v test_vision_controller.py test_gameplay.py
+.venv/bin/python -m unittest -v test_vision_controller.py test_gameplay.py test_esp32_power.py
 ```

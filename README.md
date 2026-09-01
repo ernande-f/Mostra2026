@@ -60,7 +60,17 @@ O menu continua limpo. Pressione `Tab` somente quando quiser conferir conexão, 
 - `ob1` bloqueia a faixa e exige desvio lateral.
 - `ob2` é baixo e exige pulo.
 - `ob3` deixa uma passagem inferior e exige agachamento.
+- O fazendeiro aparece ocasionalmente mirando a faixa atual da vaca. Uma
+  colisão com ele desintegra toda a cena e devolve o jogo diretamente ao menu.
 - Uma colisão encerra a partida e registra a pontuação no ranking.
+
+## Áudio
+
+- O menu usa uma música espacial tranquila.
+- Ao começar a partida, a trilha muda para uma versão mais rápida e pulsante.
+- Cada pulo toca seu próprio efeito e uma colisão fatal toca o efeito de morte.
+- O áudio é carregado de forma segura: se o computador estiver sem saída de
+  som disponível, o jogo continua funcionando normalmente.
 
 ## Execução pelo terminal
 

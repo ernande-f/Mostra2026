@@ -22,6 +22,10 @@ FPS = 60
 PASTA_PROJETO = Path(__file__).resolve().parent
 ARQUIVO_RANKING = PASTA_PROJETO / "dados" / "ranking.json"
 VIDEO_FUNDO_JOGO = PASTA_PROJETO / "videos" / "gif_fundo_saturno.mp4"
+SOM_PULO = PASTA_PROJETO / "Sons" / "previas" / "pulo_espacial.wav"
+SOM_MORTE = PASTA_PROJETO / "Sons" / "previas" / "morte_power_down.wav"
+MUSICA_MENU = PASTA_PROJETO / "Sons" / "previas" / "musica_1_orbita_tranquila.wav"
+MUSICA_GAMEPLAY = PASTA_PROJETO / "Sons" / "previas" / "musica_gameplay_acao.wav"
 AREA_BOTAO_JOGAR = (230, 390, 440, 54)
 
 # O jogo usa um unico ritmo fixo, sem aceleracao progressiva escondida.
@@ -42,7 +46,8 @@ PROGRESSO_MINIMO_VISIVEL = -0.04
 # ==========================================
 # Os anéis de Saturno ficam na metade direita da imagem
 HORIZON_Y = 220
-BASE_Y = 620
+# A vaca fica mais proxima da borda inferior e continua com espaco para pular.
+BASE_Y = 655
 PROGRESSO_PLANO_VACA = (
     (BASE_Y - HORIZON_Y)
     / (BASE_Y - HORIZON_Y + 120)
@@ -82,6 +87,10 @@ ENABLE_CROUCH = True
 # Dimensões dos Obstáculos
 TAMANHO_OBSTACULO_MIN = 20
 TAMANHO_OBSTACULO_MAX = 74
+
+# O fazendeiro e um encontro raro, mais rapido que os obstaculos comuns.
+INTERVALO_FAZENDEIRO_MIN = FPS * 15
+INTERVALO_FAZENDEIRO_MAX = FPS * 23
 
 
 # =========================================================
@@ -169,6 +178,72 @@ class RankingPersistente:
         except OSError as exc:
             # Uma falha de escrita nao pode derrubar a partida.
             print(f"[RANKING] Nao foi possivel salvar {self.caminho}: {exc}")
+
+
+# =========================================================
+# AUDIO (MUSICA DE MENU, TRILHA DE ACAO E EFEITOS)
+# =========================================================
+class AudioJogo:
+    """Centraliza o audio e deixa o jogo funcionar mesmo sem dispositivo sonoro."""
+
+    def __init__(self):
+        self.disponivel = pygame.mixer.get_init() is not None
+        self.faixa_atual = None
+        self.som_pulo = None
+        self.som_morte = None
+        if not self.disponivel:
+            print("[AUDIO] Mixer indisponivel; seguindo sem som.")
+            return
+
+        try:
+            self.som_pulo = pygame.mixer.Sound(str(SOM_PULO))
+            self.som_pulo.set_volume(0.58)
+            self.som_morte = pygame.mixer.Sound(str(SOM_MORTE))
+            self.som_morte.set_volume(0.76)
+        except (OSError, pygame.error) as exc:
+            print(f"[AUDIO] Nao foi possivel carregar os efeitos: {exc}")
+
+    def _tocar_musica(self, caminho, volume):
+        if not self.disponivel or not Path(caminho).exists():
+            return
+        caminho = Path(caminho)
+        try:
+            if self.faixa_atual != caminho:
+                pygame.mixer.music.fadeout(280)
+                pygame.mixer.music.load(str(caminho))
+                self.faixa_atual = caminho
+            if not pygame.mixer.music.get_busy():
+                pygame.mixer.music.set_volume(volume)
+                pygame.mixer.music.play(-1, fade_ms=420)
+            else:
+                pygame.mixer.music.set_volume(volume)
+        except (OSError, pygame.error) as exc:
+            print(f"[AUDIO] Nao foi possivel tocar {caminho.name}: {exc}")
+
+    def tocar_menu(self):
+        self._tocar_musica(MUSICA_MENU, 0.28)
+
+    def tocar_gameplay(self):
+        self._tocar_musica(MUSICA_GAMEPLAY, 0.32)
+
+    def tocar_pulo(self):
+        if self.som_pulo is not None:
+            self.som_pulo.play()
+
+    def tocar_morte(self):
+        if self.som_morte is not None:
+            self.som_morte.play()
+
+    def parar_musica(self, fade_ms=500):
+        if self.disponivel:
+            pygame.mixer.music.fadeout(fade_ms)
+            # Forca o proximo menu/reinicio a recarregar a faixa, mesmo se o
+            # jogador apertar uma tecla antes de o fade terminar.
+            self.faixa_atual = None
+
+    def desligar(self):
+        if self.disponivel:
+            pygame.mixer.music.stop()
 
 
 # =========================================================
@@ -591,9 +666,29 @@ def criar_obstaculo(velocidade_base=1.0):
     }
 
 
-def carregar_assets_obstaculos():
-    """Carrega os tres desafios novos e mantem os assets antigos como fallback."""
+def criar_fazendeiro(lane_idx, velocidade_base=1.0):
+    """Cria o perseguidor especial mirando a faixa atual do jogador."""
+    lane_idx = max(0, min(NUM_LANES - 1, int(lane_idx)))
     return {
+        'tipo': 'fazendeiro',
+        'lane_idx': lane_idx,
+        'lane': LANE_RATIOS[lane_idx],
+        'progresso_y': PROGRESSO_SPAWN,
+        'velocidade': 0.021 * velocidade_base,
+    }
+
+
+def recortar_transparencia(imagem):
+    """Remove margens transparentes para o sprite encostar no plano da pista."""
+    limites = imagem.get_bounding_rect(min_alpha=10)
+    if limites.width <= 0 or limites.height <= 0:
+        return imagem
+    return imagem.subsurface(limites).copy()
+
+
+def carregar_assets_obstaculos():
+    """Carrega os tres desafios e o fazendeiro, removendo folgas transparentes."""
+    assets = {
         'bloqueio': carregar_asset([
             "Imagens/ob1.png",
             "Imagens/obstaculos/caixa_energia.png",
@@ -609,16 +704,31 @@ def carregar_assets_obstaculos():
             "Imagens/obstaculos/portal_agachar.png",
             "p_atras.png",
         ], com_alpha=True),
+        'fazendeiro': carregar_asset([
+            "Imagens/fazendeiro.png",
+        ], com_alpha=True),
     }
+    return {
+        tipo: recortar_transparencia(imagem)
+        for tipo, imagem in assets.items()
+    }
+
+
+LAYOUT_OBSTACULOS = {
+    # Multiplicador de altura e proporcao dos recortes opacos de cada arte.
+    'bloqueio': (3.80, 323 / 608),  # ob1: alto demais para pular ou agachar
+    'chao': (1.76, 1.0),           # ob2: exige pulo
+    'alto': (3.12, 361 / 532),     # ob3: exige agachamento
+    'fazendeiro': (4.15, 570 / 988),
+}
 
 
 def calcular_rect_obstaculo(obs):
     """Retorna o retangulo visual do sprite respeitando a perspectiva."""
     cx, cy, tamanho = calcular_posicao_pista(obs['progresso_y'], obs['lane'])
-    # ob1/ob2/ob3 compartilham um canvas de 209x385. Manter essa proporcao
-    # faz a copa alta e o obstaculo baixo continuarem alinhados no mesmo plano.
-    altura = max(24, int(tamanho * 3.80))
-    largura = max(12, int(altura * (209 / 385)))
+    multiplicador_altura, aspecto = LAYOUT_OBSTACULOS[obs['tipo']]
+    altura = max(24, int(tamanho * multiplicador_altura))
+    largura = max(12, int(altura * aspecto))
     rect = pygame.Rect(0, 0, largura, altura)
     rect.midbottom = (int(cx), int(cy))
     return rect, cx, cy, tamanho
@@ -629,10 +739,10 @@ def calcular_hitbox_obstaculo(obs):
     rect, _, _, _ = calcular_rect_obstaculo(obs)
     if obs['tipo'] == 'chao':
         return pygame.Rect(
-            rect.x + rect.width * 0.16,
-            rect.y + rect.height * 0.45,
-            rect.width * 0.68,
-            rect.height * 0.50,
+            rect.x + rect.width * 0.13,
+            rect.y + rect.height * 0.12,
+            rect.width * 0.74,
+            rect.height * 0.80,
         )
 
     if obs['tipo'] == 'alto':
@@ -644,6 +754,14 @@ def calcular_hitbox_obstaculo(obs):
             rect.height * 0.52,
         )
 
+    if obs['tipo'] == 'fazendeiro':
+        return pygame.Rect(
+            rect.x + rect.width * 0.18,
+            rect.y + rect.height * 0.08,
+            rect.width * 0.64,
+            rect.height * 0.88,
+        )
+
     # ob1 fecha a faixa da copa ate a base: pular ou agachar nao basta.
     return pygame.Rect(
         rect.x + rect.width * 0.10,
@@ -651,6 +769,16 @@ def calcular_hitbox_obstaculo(obs):
         rect.width * 0.80,
         rect.height * 0.93,
     )
+
+
+def vaca_colide_com_obstaculo(vaca, obs):
+    """Aplica a regra do desafio alem da aproximacao geometrica da hitbox."""
+    # A abertura do ob3 foi feita especificamente para a vaca agachada. Perto
+    # do fim da janela de colisao, a perspectiva pode fazer a hitbox do travessao
+    # crescer alguns pixels para baixo; isso nunca deve invalidar o agachamento.
+    if obs['tipo'] == 'alto' and vaca.is_crouching:
+        return False
+    return vaca.get_hitbox().colliderect(calcular_hitbox_obstaculo(obs))
 
 
 def desenhar_guias_faixas(canvas):
@@ -679,7 +807,7 @@ def desenhar_obstaculo(canvas, obs, imagens_obstaculos):
     rect, _, _, tamanho = calcular_rect_obstaculo(obs)
     imagem = imagens_obstaculos[obs['tipo']]
 
-    if obs['tipo'] == 'chao':
+    if obs['tipo'] in ('chao', 'fazendeiro'):
         sombra = pygame.Surface((rect.width, max(4, int(tamanho * 0.25))), pygame.SRCALPHA)
         pygame.draw.ellipse(sombra, (5, 8, 18, 115), sombra.get_rect())
         canvas.blit(sombra, (rect.x, rect.bottom - sombra.get_height() // 2))
@@ -758,6 +886,7 @@ class VacaPlayer:
         return cx - (LARGURA_VACA_NORMAL / 2.0)
 
     def update(self, input_ctrl):
+        pulou_agora = False
         # 1. Camera envia a faixa absoluta; teclado continua como fallback.
         target_lane, shift = input_ctrl.consume_lane_commands()
         if target_lane is not None:
@@ -778,6 +907,7 @@ class VacaPlayer:
         if input_ctrl.consume_jump() and not self.is_jumping:
             self.is_jumping = True
             self.vel_y = self.forca_pulo
+            pulou_agora = True
 
         # 3. Física do Pulo no ar
         if self.is_jumping:
@@ -794,6 +924,7 @@ class VacaPlayer:
 
         # 4. Controle de animação
         self.frame_index = (self.frame_index + self.anim_speed) % len(self.frames_andar)
+        return pulou_agora
 
     def get_hitbox(self):
         """Retorna a hitbox ajustada para o pulo."""
@@ -842,6 +973,72 @@ class VacaPlayer:
             # Pose normal correndo
             img = self.frames_andar[idx]
             surface.blit(img, (self.x, self.y_base - ALTURA_VACA_NORMAL))
+
+
+# =========================================================
+# DESINTEGRACAO ESPECIAL AO COLIDIR COM O FAZENDEIRO
+# =========================================================
+class DesintegracaoTela:
+    """Fragmenta o quadro inteiro em blocos e dissolve tudo para o vazio."""
+
+    def __init__(self, quadro, origem, agora=None, duracao=1.75, bloco=40):
+        self.inicio = time.monotonic() if agora is None else agora
+        self.duracao = duracao
+        self.blocos = []
+        origem_x, origem_y = origem
+        sorteio = random.Random(26082026)
+        distancia_max = math.hypot(LARGURA_VIRTUAL, ALTURA_VIRTUAL)
+
+        for y in range(0, quadro.get_height(), bloco):
+            for x in range(0, quadro.get_width(), bloco):
+                largura = min(bloco, quadro.get_width() - x)
+                altura = min(bloco, quadro.get_height() - y)
+                imagem = quadro.subsurface((x, y, largura, altura)).copy()
+                centro_x = x + largura / 2.0
+                centro_y = y + altura / 2.0
+                dx = centro_x - origem_x
+                dy = centro_y - origem_y
+                distancia = max(1.0, math.hypot(dx, dy))
+                direcao_x = dx / distancia
+                direcao_y = dy / distancia
+                velocidade = sorteio.uniform(95.0, 285.0)
+                atraso = min(0.34, distancia / distancia_max * 0.28)
+                atraso += sorteio.uniform(0.0, 0.055)
+                self.blocos.append({
+                    "imagem": imagem,
+                    "x": float(x),
+                    "y": float(y),
+                    "vx": direcao_x * velocidade + sorteio.uniform(-45.0, 45.0),
+                    "vy": direcao_y * velocidade + sorteio.uniform(-65.0, 20.0),
+                    "atraso": atraso,
+                    "fase": sorteio.uniform(0.0, math.tau),
+                })
+
+    def desenhar(self, canvas, agora=None):
+        agora = time.monotonic() if agora is None else agora
+        progresso = max(0.0, min(1.0, (agora - self.inicio) / self.duracao))
+        canvas.fill((2, 3, 12))
+
+        for bloco in self.blocos:
+            atraso = bloco["atraso"]
+            local = max(0.0, min(1.0, (progresso - atraso) / max(0.01, 1.0 - atraso)))
+            if local >= 1.0:
+                continue
+            deslocamento = local * local * self.duracao
+            x = bloco["x"] + bloco["vx"] * deslocamento
+            y = bloco["y"] + bloco["vy"] * deslocamento
+            y += 150.0 * local * local
+            x += math.sin(bloco["fase"] + local * 13.0) * 14.0 * local
+            bloco["imagem"].set_alpha(int(255 * (1.0 - local) ** 1.65))
+            canvas.blit(bloco["imagem"], (int(x), int(y)))
+
+        if progresso < 0.22:
+            flash = pygame.Surface((LARGURA_VIRTUAL, ALTURA_VIRTUAL), pygame.SRCALPHA)
+            alpha = int(185 * (1.0 - progresso / 0.22))
+            flash.fill((125, 245, 255, alpha))
+            canvas.blit(flash, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        return progresso >= 1.0
 
 
 # =========================================================
@@ -1185,7 +1382,10 @@ def tela_inicial(
     ranking,
     nome_jogador="JOGADOR",
     power_ctrl=None,
+    audio=None,
 ):
+    if audio is not None:
+        audio.tocar_menu()
     fundo = FundoGifAnimado(
         PASTA_PROJETO / "Imagens" / "fundo_inicio.gif",
         (LARGURA_VIRTUAL, ALTURA_VIRTUAL),
@@ -1303,6 +1503,7 @@ def loop_gameplay(
     ranking,
     nome_jogador,
     power_ctrl=None,
+    audio=None,
 ):
     fonte_hud = pygame.font.SysFont("Arial", 28, bold=True)
     fonte_go_grande = pygame.font.SysFont("Arial", 64, bold=True)
@@ -1311,6 +1512,8 @@ def loop_gameplay(
     config_dificuldade = DIFICULDADES[MODO_JOGO]
 
     while True:
+        if audio is not None:
+            audio.tocar_gameplay()
         if power_ctrl is not None:
             power_ctrl.set_enabled(True, reset=True)
         vaca = VacaPlayer(frames_andar, frames_agachar)
@@ -1319,10 +1522,17 @@ def loop_gameplay(
         obstaculos = []
         spawn_timer = 0
         spawn_intervalo = config_dificuldade["spawn"]
+        fazendeiro_timer = 0
+        proximo_fazendeiro = random.randint(
+            INTERVALO_FAZENDEIRO_MIN,
+            INTERVALO_FAZENDEIRO_MAX,
+        )
         pontuacao = 0.0
         distancia = 0.0
         game_over = False
         posicao_ranking = None
+        desintegracao = None
+        origem_desintegracao = None
 
         partida_ativa = True
         while partida_ativa:
@@ -1343,6 +1553,14 @@ def loop_gameplay(
 
             input_ctrl.update_from_keyboard(pygame.key.get_pressed())
 
+            if desintegracao is not None:
+                canvas = display_mgr.virtual_screen
+                if desintegracao.desenhar(canvas):
+                    return True
+                display_mgr.render()
+                clock.tick(FPS)
+                continue
+
             if not game_over:
                 velocidade_modo = config_dificuldade["velocidade"]
                 pontuacao += velocidade_modo
@@ -1353,8 +1571,24 @@ def loop_gameplay(
                     obstaculos.append(criar_obstaculo(velocidade_base=velocidade_modo))
                     spawn_timer = 0
 
-                vaca.update(input_ctrl)
-                hitbox_vaca = vaca.get_hitbox()
+                fazendeiro_timer += 1
+                fazendeiro_ativo = any(
+                    obs['tipo'] == 'fazendeiro'
+                    for obs in obstaculos
+                )
+                if fazendeiro_timer >= proximo_fazendeiro and not fazendeiro_ativo:
+                    obstaculos.append(criar_fazendeiro(
+                        vaca.current_lane,
+                        velocidade_base=velocidade_modo,
+                    ))
+                    fazendeiro_timer = 0
+                    proximo_fazendeiro = random.randint(
+                        INTERVALO_FAZENDEIRO_MIN,
+                        INTERVALO_FAZENDEIRO_MAX,
+                    )
+
+                if vaca.update(input_ctrl) and audio is not None:
+                    audio.tocar_pulo()
 
                 for obs in obstaculos:
                     obs['progresso_y'] += obs['velocidade']
@@ -1363,7 +1597,14 @@ def loop_gameplay(
                 for obs in obstaculos:
                     _, cy, _ = calcular_posicao_pista(obs['progresso_y'], obs['lane'])
                     if BASE_Y - 45 <= cy <= BASE_Y + 35:
-                        if hitbox_vaca.colliderect(calcular_hitbox_obstaculo(obs)):
+                        if vaca_colide_com_obstaculo(vaca, obs):
+                            if obs['tipo'] == 'fazendeiro':
+                                rect_fazendeiro, _, _, _ = calcular_rect_obstaculo(obs)
+                                origem_desintegracao = rect_fazendeiro.center
+                                if audio is not None:
+                                    audio.parar_musica(260)
+                                    audio.tocar_morte()
+                                break
                             escudo_absorveu = (
                                 power_ctrl is not None
                                 and power_ctrl.absorb_collision()
@@ -1372,6 +1613,9 @@ def loop_gameplay(
                                 obs["removido_pelo_escudo"] = True
                             else:
                                 game_over = True
+                                if audio is not None:
+                                    audio.parar_musica(420)
+                                    audio.tocar_morte()
                                 posicao_ranking = ranking.registrar(
                                     nome_jogador,
                                     int(pontuacao),
@@ -1478,6 +1722,14 @@ def loop_gameplay(
                 canvas.blit(txt_sub1, (LARGURA_VIRTUAL // 2 - txt_sub1.get_width() // 2, 415))
                 canvas.blit(txt_sub2, (LARGURA_VIRTUAL // 2 - txt_sub2.get_width() // 2, 460))
 
+            if origem_desintegracao is not None:
+                desintegracao = DesintegracaoTela(
+                    canvas.copy(),
+                    origem_desintegracao,
+                )
+                desintegracao.desenhar(canvas)
+                origem_desintegracao = None
+
             display_mgr.render()
             clock.tick(FPS)
 
@@ -1486,6 +1738,7 @@ def loop_gameplay(
 # PONTO DE ENTRADA PRINCIPAL
 # =========================================================
 def main():
+    pygame.mixer.pre_init(44_100, -16, 2, 512)
     pygame.init()
     pygame.font.init()
 
@@ -1498,6 +1751,7 @@ def main():
     power_ctrl = Esp32PowerController()
     power_ctrl.start()
     ranking = RankingPersistente()
+    audio = AudioJogo()
     nome_jogador = "JOGADOR"
     fundo_cenario = None
 
@@ -1528,6 +1782,7 @@ def main():
                 ranking,
                 nome_jogador,
                 power_ctrl,
+                audio,
             )
             continuar = loop_gameplay(
                 display_mgr,
@@ -1540,6 +1795,7 @@ def main():
                 ranking,
                 nome_jogador,
                 power_ctrl,
+                audio,
             )
             if not continuar:
                 break
@@ -1548,6 +1804,7 @@ def main():
             fundo_cenario.close()
         power_ctrl.stop()
         vision_ctrl.stop()
+        audio.desligar()
         pygame.quit()
 
 

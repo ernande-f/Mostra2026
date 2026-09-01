@@ -49,6 +49,31 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
             self.assertTrue(image.get_flags() & pygame.SRCALPHA)
             self.assertGreater(image.get_bounding_rect(min_alpha=10).width, 100)
             self.assertGreater(image.get_bounding_rect(min_alpha=10).height, 100)
+            self.assertEqual(image.get_bounding_rect(min_alpha=10), image.get_rect())
+
+    def test_audio_assets_and_both_music_moods_are_available(self):
+        for path in (
+            main.SOM_PULO,
+            main.SOM_MORTE,
+            main.MUSICA_MENU,
+            main.MUSICA_GAMEPLAY,
+        ):
+            self.assertTrue(path.is_file(), path)
+            self.assertGreater(path.stat().st_size, 20_000)
+
+        audio = main.AudioJogo()
+        self.assertIsNotNone(audio.som_pulo)
+        self.assertIsNotNone(audio.som_morte)
+
+    def test_cow_was_lowered_toward_the_bottom_of_the_screen(self):
+        self.assertGreaterEqual(main.BASE_Y, 650)
+
+    def test_jump_update_reports_exactly_when_the_sound_should_play(self):
+        cow = self.cow()
+        controller = main.InputController()
+        controller.trigger_jump("teste")
+        self.assertTrue(cow.update(controller))
+        self.assertFalse(cow.update(controller))
 
     def test_crouched_sprite_is_visibly_lower_than_standing_sprite(self):
         self.assertLess(
@@ -107,6 +132,26 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
         cow.is_crouching = True
         self.assertFalse(cow.get_hitbox().colliderect(gate_hitbox))
 
+    def test_crouch_clears_gate_through_the_entire_collision_window(self):
+        crouched_cow = self.cow()
+        crouched_cow.is_crouching = True
+        standing_cow = self.cow()
+        standing_collisions = []
+        alcance_vertical = main.BASE_Y - main.HORIZON_Y + 120
+
+        for cy in range(main.BASE_Y - 45, main.BASE_Y + 36, 3):
+            gate = self.obstacle("alto")
+            gate["progresso_y"] = (cy - main.HORIZON_Y) / alcance_vertical
+            self.assertFalse(
+                main.vaca_colide_com_obstaculo(crouched_cow, gate),
+                f"ob3 colidiu agachado em y={cy}",
+            )
+            standing_collisions.append(
+                main.vaca_colide_com_obstaculo(standing_cow, gate)
+            )
+
+        self.assertTrue(any(standing_collisions))
+
     def test_full_obstacle_requires_changing_lane(self):
         obstacle_hitbox = main.calcular_hitbox_obstaculo(self.obstacle("bloqueio"))
 
@@ -128,6 +173,35 @@ class GameplayVisualAndCollisionTests(unittest.TestCase):
             self.assertFalse(cow.get_hitbox().colliderect(
                 main.calcular_hitbox_obstaculo(self.obstacle(kind, lane=2))
             ))
+
+    def test_farmer_targets_the_current_lane_and_hits_the_cow(self):
+        farmer = main.criar_fazendeiro(1, velocidade_base=1.0)
+        self.assertEqual(farmer["tipo"], "fazendeiro")
+        self.assertEqual(farmer["lane_idx"], 1)
+        self.assertGreater(farmer["velocidade"], 0.016)
+
+        farmer["progresso_y"] = self.base_progress
+        self.assertTrue(self.cow(1).get_hitbox().colliderect(
+            main.calcular_hitbox_obstaculo(farmer)
+        ))
+        self.assertFalse(self.cow(0).get_hitbox().colliderect(
+            main.calcular_hitbox_obstaculo(farmer)
+        ))
+
+    def test_farmer_collision_disintegrates_the_whole_frame(self):
+        frame = pygame.Surface((160, 90))
+        frame.fill((200, 120, 40))
+        effect = main.DesintegracaoTela(
+            frame,
+            origem=(80, 45),
+            agora=10.0,
+            duracao=1.0,
+            bloco=20,
+        )
+        canvas = frame.copy()
+        self.assertFalse(effect.desenhar(canvas, agora=10.4))
+        self.assertTrue(effect.desenhar(canvas, agora=11.0))
+        self.assertEqual(canvas.get_at((80, 45))[:3], (2, 3, 12))
 
     def test_obstacle_is_born_at_the_beginning_of_the_rings(self):
         obstacle = main.criar_obstaculo()
